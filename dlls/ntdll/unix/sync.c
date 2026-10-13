@@ -2194,13 +2194,62 @@ static void ios_eco_init(void)
     __atomic_store_n( &ios_eco_on, madeira_cfg_bool( "eco", 0 ) ? 1 : 0, __ATOMIC_RELEASE );
 }
 
+/* Madeira Dock: once the game is running, Valve's client (dockhost.exe, the
+ * same iOS process as the game) only has to stay connected. Its HTTP thread
+ * alone kept 20-30 % of a core busy for the whole session (a fresh TLS
+ * connection to api.steampowered.com about twice a second), at the game's own
+ * QoS, so the scheduler gave it performance-core time the game's main thread
+ * was short of. From the game's spawn its threads run at utility QoS: efficiency
+ * cores first, the game keeps the fast ones. env.MADEIRA_DOCK_LOW_QOS = 0 keeps
+ * the client at full priority. */
+static volatile int ios_dock_game_running;
+static __thread int ios_thread_in_dock = -1;   /* -1 = not checked yet */
+
+static int ios_thread_is_dock(void)
+{
+    if (ios_thread_in_dock < 0)
+    {
+        static const WCHAR name[] = {'d','o','c','k','h','o','s','t','.','e','x','e'};
+        const RTL_USER_PROCESS_PARAMETERS *pp = NtCurrentTeb() && NtCurrentTeb()->Peb ?
+            NtCurrentTeb()->Peb->ProcessParameters : NULL;
+        int in = 0;
+        if (!pp || !pp->ImagePathName.Buffer) return 0;   /* not known yet: ask again next time */
+        {
+            int len = pp->ImagePathName.Length / sizeof(WCHAR), n = ARRAY_SIZE(name), i;
+            if (len >= n)
+            {
+                in = 1;
+                for (i = 0; i < n && in; i++)
+                {
+                    WCHAR c = pp->ImagePathName.Buffer[len - n + i];
+                    if (c >= 'A' && c <= 'Z') c += 32;
+                    if (c != name[i]) in = 0;
+                }
+            }
+        }
+        ios_thread_in_dock = in;
+    }
+    return ios_thread_in_dock;
+}
+
+void madeira_dock_game_started(void)
+{
+    const char *dock = getenv( "MADEIRA_DOCK_SESSION" ), *off = getenv( "MADEIRA_DOCK_LOW_QOS" );
+    if (!dock || dock[0] != '1' || (off && off[0] == '0') || ios_dock_game_running) return;
+    ios_dock_game_running = 1;
+    __atomic_add_fetch( &ios_eco_gen, 1, __ATOMIC_RELEASE );
+    fprintf( stderr, "[dock-qos] the game is running: Valve's client (dockhost.exe) threads -> utility QoS\n" );
+}
+
 /* Called by every guest thread when it starts (thread_ios.c) and from the
  * wait/sleep/yield entry points below when the generation moved. */
 void ios_eco_apply_self(void)
 {
     ios_eco_init();
     ios_eco_seen = __atomic_load_n( &ios_eco_gen, __ATOMIC_ACQUIRE );
-    pthread_set_qos_class_self_np( ios_eco_on > 0 ? ios_eco_class : QOS_CLASS_USER_INTERACTIVE, 0 );
+    pthread_set_qos_class_self_np( ios_eco_on > 0 ? ios_eco_class
+                                   : ios_dock_game_running && ios_thread_is_dock() ? QOS_CLASS_UTILITY
+                                   : QOS_CLASS_USER_INTERACTIVE, 0 );
 }
 #define IOS_ECO_POLL() do { if (__builtin_expect( ios_eco_seen != ios_eco_gen, 0 )) ios_eco_apply_self(); } while (0)
 
@@ -3574,26 +3623,36 @@ NTSTATUS WINAPI NtYieldExecution(void)
      * thread and heats the package into throttling. After a burst of back-to-back
      * yields the thread is put to sleep for 100 us instead: the same forward
      * progress with a bounded latency cost. Streaks reset after a 2 ms gap. */
+    /* ml1311: the streak must also have lasted yield-spin-us (default 1000) of wall
+     * time. 256 back-to-back yields take well under a millisecond, so the count
+     * alone put threads to sleep for 100 us in the middle of short hand-offs: an
+     * Unreal Engine 3 game thread waiting microseconds for its render thread slept
+     * 3,000-5,000 times a second in CPU-bound scenes. A spinner idle for a whole
+     * millisecond is still put to sleep, which is what the heat guard is for. */
     {
-        static __thread unsigned long long ios_last_yield_ns;
+        static __thread unsigned long long ios_last_yield_ns, ios_streak_start_ns;
         static __thread unsigned ios_yield_streak;
         struct timespec ts;
         unsigned long long now;
         clock_gettime( CLOCK_MONOTONIC, &ts );
         now = (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-        static long long ios_ysleep = -1, ios_ystreak = 256;   /* ml1124: madeira.cfg yield-sleep-us (default 100, 0 = never sleep), yield-streak (256) */
+        static long long ios_ysleep = -1, ios_ystreak = 256, ios_yspin_ns = 1000000;   /* ml1124: madeira.cfg yield-sleep-us (default 100, 0 = never sleep), yield-streak (256); ml1311 yield-spin-us (1000) */
         if (ios_ysleep < 0)
         {
+            long long spin_us;
             ios_ystreak = madeira_cfg_int( "yield-streak", 256 );
+            spin_us = madeira_cfg_int( "yield-spin-us", 1000 );
+            ios_yspin_ns = spin_us > 0 ? spin_us * 1000 : 0;
             ios_ysleep = madeira_cfg_int( "yield-sleep-us", 100 );
             if (ios_ysleep < 0) ios_ysleep = 0;
-            fprintf( stderr, "[sync-census] ml1124 adaptive yield: sleep %lld us after %lld back-to-back yields%s\n",
-                     ios_ysleep, ios_ystreak, ios_ysleep ? "" : " (DISABLED)" );
+            fprintf( stderr, "[sync-census] ml1124 adaptive yield: sleep %lld us after %lld back-to-back yields spanning %lld us%s\n",
+                     ios_ysleep, ios_ystreak, ios_yspin_ns / 1000, ios_ysleep ? "" : " (DISABLED)" );
         }
-        if (now - ios_last_yield_ns < 2000000ull) ios_yield_streak++; else ios_yield_streak = 0;
+        if (now - ios_last_yield_ns < 2000000ull) ios_yield_streak++;
+        else { ios_yield_streak = 0; ios_streak_start_ns = now; }
         ios_last_yield_ns = now;
         __sync_fetch_and_add( &ios_xp_yield, 1 );   /* ml1131 */
-        if (ios_ysleep && ios_yield_streak > ios_ystreak)
+        if (ios_ysleep && ios_yield_streak > ios_ystreak && now - ios_streak_start_ns >= (unsigned long long)ios_yspin_ns)
         {
             __sync_fetch_and_add( &ios_xp_yield_slept, 1 );
             usleep( (useconds_t)ios_ysleep );
@@ -5119,9 +5178,23 @@ void ios_orphan_check( const unsigned long long *live_stamps, int nstamps )
         susp[j].strikes++;
         dprintf( 2, "[lock-orphan] SRW %#llx word=%08x waiters=%d no-live-stamp strike=%d/3 rev=ml447\n",
                  lock, word, nsame, susp[j].strikes );
+        /* ml1316: "no live stamp" only means no recorded owner, not a dead one.
+         * Stamps come from some acquire paths only, so a lock a live thread took
+         * elsewhere (x86-64 code under emulation) looks the same: Slime Rancher had
+         * ten threads waiting on a lock its owner still held, the reap released
+         * it under that owner, and the next thread died outright. Reaping on this
+         * evidence is now opt-in (MADEIRA_SRW_REAP_UNSTAMPED=1); a proven-dead
+         * owner is still reaped through the dead-thread path. */
         if (susp[j].strikes >= 3)
         {
-            ios_srw_reap_exclusive( lock, 0xDEADull );
+            static int reap_unstamped = -1;
+            if (reap_unstamped < 0)
+            {
+                const char *v = getenv( "MADEIRA_SRW_REAP_UNSTAMPED" );
+                reap_unstamped = v && *v == '1';
+            }
+            if (reap_unstamped) ios_srw_reap_exclusive( lock, 0xDEADull );
+            else dprintf( 2, "[lock-orphan] SRW %#llx left held: owner unknown, not proven dead rev=ml1316\n", lock );
             susp[j].lock = 0;
             susp[j].strikes = 0;
         }

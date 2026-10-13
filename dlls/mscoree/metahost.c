@@ -791,7 +791,9 @@ HRESULT ICLRRuntimeInfo_GetRuntimeHost(ICLRRuntimeInfo *iface, RuntimeHost **res
 
 #ifdef __i386__
 static const WCHAR libmono2_arch_dll[] = {'\\','b','i','n','\\','l','i','b','m','o','n','o','-','2','.','0','-','x','8','6','.','d','l','l',0};
-#elif defined(__x86_64__)
+#elif defined(__x86_64__) || defined(__arm64ec__)
+/* ARM64EC: Wine Mono ships x86 and x86_64 runtimes only, and an ARM64EC process
+ * runs the x86_64 one (Terraria and other .NET games on Madeira). */
 static const WCHAR libmono2_arch_dll[] = {'\\','b','i','n','\\','l','i','b','m','o','n','o','-','2','.','0','-','x','8','6','_','6','4','.','d','l','l',0};
 #else
 static const WCHAR libmono2_arch_dll[] = {'\\','b','i','n','\\','l','i','b','m','o','n','o','-','2','.','0','.','d','l','l',0};

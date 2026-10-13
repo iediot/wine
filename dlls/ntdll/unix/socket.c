@@ -488,6 +488,11 @@ static int convert_control_headers(struct msghdr *hdr, WSABUF *control)
 #endif /* IP_PKTINFO */
 
 #if defined(IP_TOS)
+#if defined(IP_RECVTOS) && IP_RECVTOS != IP_TOS
+                    /* Darwin/BSD return the receive option as the message type,
+                     * while Linux returns IP_TOS. Winsock expects IP_TOS. */
+                    case IP_RECVTOS:
+#endif
                     case IP_TOS:
                     {
                         INT tos = *(unsigned char *)CMSG_DATA(cmsg_unix);
@@ -598,25 +603,32 @@ static int wow64_translate_control( const WSABUF *control64, struct afd_wsabuf_3
     {
         struct cmsghdr_32 *cmsg32 = (struct cmsghdr_32 *)ptr32;
         const WSACMSGHDR *cmsg64 = (const WSACMSGHDR *)ptr64;
+        size_t remaining = control64->buf + control64->len - ptr64;
+        size_t payload, message_size;
 
-        if (ptr32 + sizeof(*cmsg32) + cmsg_align_32( cmsg64->cmsg_len ) > buf32 + max_len)
-        {
-            control32->len = 0;
-            return 0;
-        }
+        if (remaining < sizeof(*cmsg64) || cmsg64->cmsg_len < sizeof(*cmsg64) ||
+            cmsg64->cmsg_len > remaining || WSA_CMSG_ALIGN( cmsg64->cmsg_len ) > remaining)
+            goto error;
+        payload = cmsg64->cmsg_len - sizeof(*cmsg64);
+        message_size = sizeof(*cmsg32) + payload;
+        if (cmsg_align_32( message_size ) > max_len - (size_t)(ptr32 - buf32)) goto error;
 
-        cmsg32->cmsg_len = cmsg64->cmsg_len - sizeof(*cmsg64) + sizeof(*cmsg32);
+        cmsg32->cmsg_len = message_size;
         cmsg32->cmsg_level = cmsg64->cmsg_level;
         cmsg32->cmsg_type = cmsg64->cmsg_type;
-        memcpy( cmsg32 + 1, cmsg64 + 1, cmsg64->cmsg_len );
+        memcpy( cmsg32 + 1, cmsg64 + 1, payload );
 
         ptr64 += WSA_CMSG_ALIGN( cmsg64->cmsg_len );
         ptr32 += cmsg_align_32( cmsg32->cmsg_len );
     }
 
     control32->len = ptr32 - buf32;
-    FIXME("-> %d\n", control32->len);
+    TRACE("-> %d\n", control32->len);
     return 1;
+
+error:
+    control32->len = 0;
+    return 0;
 }
 
 struct ip_hdr
@@ -905,6 +917,7 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
  * Caveat kept from ml590: TLS 1.3 puts EncryptedExtensions/Certificate/
  * CertificateVerify/Finished/NewSessionTicket ALL under record type 0x17, so the tail
  * read is "post-handshake", not provably application data. */
+#include <arpa/inet.h>   /* inet_ntop, for the peer address in host= */
 #define IOS_TL_SLOTS 128
 struct ios_tl_ent
 {
@@ -916,7 +929,41 @@ struct ios_tl_ent
     unsigned long      b_send, b_recv;
     int                post_len;
     unsigned char      post5[5];
+    char               host[64];    /* TLS SNI from the ClientHello, or the peer IP */
 };
+
+/* The server name a TLS ClientHello asks for (the SNI extension, plain text), so
+ * a connection's line names who it talks to. 0 when absent or truncated. */
+static int ios_tl_sni( const unsigned char *b, long n, char *out, size_t outsz )
+{
+    long p = 43, end, ext_end;
+    if (n < 44 || b[0] != 0x16 || b[5] != 0x01) return 0;
+    p += 1 + b[43];                                           /* session id */
+    if (p + 2 > n) return 0;
+    p += 2 + ((b[p] << 8) | b[p + 1]);                        /* cipher suites */
+    if (p + 1 > n) return 0;
+    p += 1 + b[p];                                            /* compression */
+    if (p + 2 > n) return 0;
+    ext_end = p + 2 + ((b[p] << 8) | b[p + 1]);
+    p += 2;
+    end = ext_end < n ? ext_end : n;
+    while (p + 4 <= end)
+    {
+        unsigned type = (b[p] << 8) | b[p + 1], len = (b[p + 2] << 8) | b[p + 3];
+        p += 4;
+        if (type == 0 && p + 5 <= end)
+        {
+            unsigned nl = (b[p + 3] << 8) | b[p + 4];
+            if (b[p + 2] != 0 || p + 5 + nl > end) return 0;
+            if (nl >= outsz) nl = outsz - 1;
+            memcpy( out, b + p + 5, nl );
+            out[nl] = 0;
+            return 1;
+        }
+        p += len;
+    }
+    return 0;
+}
 static struct ios_tl_ent ios_tl_tab[IOS_TL_SLOTS];
 static unsigned int ios_tl_gen;
 
@@ -945,12 +992,13 @@ static void ios_tl_flush( struct ios_tl_ent *e, const char *fate )
 
     dprintf( 2, "[sock-tl] fd=%d gen=%u port=%u open->CH=%.1f CH->flight=%.1f "
                 "flight->fin=%.1f fin->tail=%.1f tail->post=%.1f total=%.1fms "
-                "tx=%u/%luB rx=%u/%luB alerts=%u post=%s fate=%s rev=ml591\n",
+                "tx=%u/%luB rx=%u/%luB alerts=%u post=%s fate=%s host=%s rev=ml591\n",
              e->fd, e->gen, e->port,
              ios_tl_d( e->t0, e->t_ch ), ios_tl_d( e->t_ch, e->t_flight ),
              ios_tl_d( e->t_flight, e->t_fin ), ios_tl_d( e->t_fin, e->t_tail ),
              ios_tl_d( e->t_tail, e->t_post ), ios_tl_d( e->t0, e->t_last ),
-             e->n_send, e->b_send, e->n_recv, e->b_recv, e->alerts, post, fate );
+             e->n_send, e->b_send, e->n_recv, e->b_recv, e->alerts, post, fate,
+             e->host[0] ? e->host : "?" );
     e->fd = -1;
 }
 
@@ -1026,6 +1074,10 @@ static void ios_sock_tl( int fd, int is_send, const void *buf, long ret_bytes, i
         e = &ios_tl_tab[freeslot];
         memset( e, 0, sizeof(*e) );
         e->fd = fd; e->port = port; e->gen = ++ios_tl_gen; e->t0 = now;
+        if (pa.ss_family == AF_INET)
+            inet_ntop( AF_INET, &((const struct sockaddr_in *)&pa)->sin_addr, e->host, sizeof(e->host) );
+        else
+            inet_ntop( AF_INET6, &((const struct sockaddr_in6 *)&pa)->sin6_addr, e->host, sizeof(e->host) );
     }
 
     e->t_last = now;
@@ -1035,7 +1087,11 @@ static void ios_sock_tl( int fd, int is_send, const void *buf, long ret_bytes, i
 
     if (is_send)
     {
-        if (rec == 0x16 && !e->t_ch) e->t_ch = now;
+        if (rec == 0x16 && !e->t_ch)
+        {
+            e->t_ch = now;
+            ios_tl_sni( b, ret_bytes, e->host, sizeof(e->host) );
+        }
         else if (rec == 0x14 && !e->t_fin) e->t_fin = now;
         else if (e->t_tail && !e->t_post)
         {
@@ -2084,12 +2140,22 @@ static NTSTATUS do_getsockopt( HANDLE handle, IO_STATUS_BLOCK *io, int level,
     socklen_t len = out_size;
     NTSTATUS status;
     int ret;
+    /* The kernel fills a local copy and the caller's buffer is written by an ordinary store. On iOS, Madeira maps
+     * anonymous RWX memory as an RX view with a separate RW alias (W^X): the kernel cannot write such a buffer
+     * (EFAULT, so WSAEFAULT where Windows succeeds), while a store into it is redirected to the alias. */
+    char local[256], *tmp = out_size <= sizeof(local) ? local : malloc( out_size );
 
+    if (!tmp) return STATUS_NO_MEMORY;
     if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
+    {
+        if (tmp != local) free( tmp );
         return status;
+    }
 
-    ret = getsockopt( fd, level, option, out_buffer, &len );
+    ret = getsockopt( fd, level, option, tmp, &len );
     if (needs_close) close( fd );
+    if (!ret) memcpy( out_buffer, tmp, min( len, out_size ) );
+    if (tmp != local) free( tmp );
     if (ret) return sock_errno_to_status( errno );
     if (io)
     {
@@ -2668,7 +2734,13 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
                 return status;
 
 #ifdef IP_DONTFRAG
-            ret = getsockopt( fd, IPPROTO_IP, IP_DONTFRAG, out_buffer, &len );
+            {   /* a local copy, see do_getsockopt */
+                char value[sizeof(DWORD)];
+
+                if (len > sizeof(value)) len = sizeof(value);
+                ret = getsockopt( fd, IPPROTO_IP, IP_DONTFRAG, value, &len );
+                if (!ret) memcpy( out_buffer, value, len );
+            }
 #elif defined(IP_MTU_DISCOVER) && defined(IP_PMTUDISC_DONT)
             {
                 int value;
@@ -2885,7 +2957,13 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
                 return status;
 
 #ifdef IPV6_DONTFRAG
-            ret = getsockopt( fd, IPPROTO_IPV6, IPV6_DONTFRAG, out_buffer, &len );
+            {   /* a local copy, see do_getsockopt */
+                char value[sizeof(DWORD)];
+
+                if (len > sizeof(value)) len = sizeof(value);
+                ret = getsockopt( fd, IPPROTO_IPV6, IPV6_DONTFRAG, value, &len );
+                if (!ret) memcpy( out_buffer, value, len );
+            }
 #elif defined(IPV6_MTU_DISCOVER) && defined(IPV6_PMTUDISC_DONT)
             {
                 int value;

@@ -573,10 +573,60 @@ static void console_host_ioctl_terminate( struct console_host_ioctl *call, unsig
     free( call );
 }
 
+#ifdef WINE_IOS
+/* Madeira: copy every line written to a console into the session log. The
+ * window conhost draws (Madeira Dock's dockhost.exe console) showed the lines
+ * that explained a failed Party Animals start -- FEX's "HOST MAP FAILED", Steam's
+ * "Thread failed to initialize" -- and none of them reached any log. Each write
+ * is cut into lines, prefixed with the writing process, and printed to stderr,
+ * which is the session log. MADEIRA_CONSOLE_LOG=0 turns it off. */
+static void madeira_console_tee( unsigned int code, struct async *async )
+{
+    static int enabled = -1;
+    static char line[1024];
+    static unsigned int len, pid;
+    struct iosb *iosb;
+    data_size_t i, n;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_CONSOLE_LOG" );
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled || !async) return;
+    if (code != IOCTL_CONDRV_WRITE_FILE && code != IOCTL_CONDRV_WRITE_CONSOLE) return;
+    if (!(iosb = async_get_iosb( async ))) return;
+    if (current && current->process && current->process->id != pid)
+    {
+        if (len) { fprintf( stderr, "[console %04x] %.*s\n", pid, (int)len, line ); len = 0; }
+        pid = current->process->id;
+    }
+    n = code == IOCTL_CONDRV_WRITE_CONSOLE ? iosb->in_size / sizeof(WCHAR) : iosb->in_size;
+    for (i = 0; i < n; i++)
+    {
+        unsigned int c = code == IOCTL_CONDRV_WRITE_CONSOLE ? ((const WCHAR *)iosb->in_data)[i]
+                                                           : ((const unsigned char *)iosb->in_data)[i];
+        if (c == '\n' || len == sizeof(line))
+        {
+            fprintf( stderr, "[console %04x] %.*s\n", pid, (int)len, line );
+            len = 0;
+            if (c == '\n') continue;
+        }
+        if (c == '\r') continue;
+        line[len++] = (c >= 0x20 && c < 0x7f) || c == '\t' ? (char)c : '?';
+    }
+    release_object( iosb );
+}
+#endif
+
 static int queue_host_ioctl( struct console_server *server, unsigned int code, unsigned int output,
                              struct async *async, struct async_queue *queue )
 {
     struct console_host_ioctl *ioctl;
+
+#ifdef WINE_IOS
+    madeira_console_tee( code, async );
+#endif
 
     if (!(ioctl = mem_alloc( sizeof(*ioctl) ))) return 0;
     ioctl->code   = code;

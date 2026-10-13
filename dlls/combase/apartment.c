@@ -365,7 +365,8 @@ static struct apartment *apartment_construct(DWORD model)
 
     TRACE("creating new apartment, model %ld\n", model);
 
-    apt = calloc(1, sizeof(*apt));
+    if (!(apt = calloc(1, sizeof(*apt))))
+        return NULL;
     apt->tid = GetCurrentThreadId();
 
     list_init(&apt->proxies);
@@ -561,6 +562,11 @@ static struct apartment *apartment_get_or_create(DWORD model)
             EnterCriticalSection(&apt_cs);
 
             apt = apartment_construct(model);
+            if (!apt)
+            {
+                LeaveCriticalSection(&apt_cs);
+                return NULL;
+            }
             if (!main_sta)
             {
                 main_sta = apt;
@@ -591,6 +597,12 @@ static struct apartment *apartment_get_or_create(DWORD model)
             }
             else
                 mta = apartment_construct(model);
+
+            if (!mta)
+            {
+                LeaveCriticalSection(&apt_cs);
+                return NULL;
+            }
 
             data->flags |= OLETLS_MULTITHREADED | OLETLS_DISABLE_OLE1DDE;
 
@@ -1187,6 +1199,12 @@ HRESULT apartment_increment_mta_usage(CO_MTA_USAGE_COOKIE *cookie)
         apartment_addref(mta);
     else
         mta = apartment_construct(COINIT_MULTITHREADED);
+    if (!mta)
+    {
+        LeaveCriticalSection(&apt_cs);
+        free(mta_cookie);
+        return E_OUTOFMEMORY;
+    }
     list_add_head(&mta->usage_cookies, &mta_cookie->entry);
 
     LeaveCriticalSection(&apt_cs);

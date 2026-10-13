@@ -238,8 +238,21 @@ static const unsigned int dir_data_buffer_initial_size = 4096;
 static const unsigned int dir_data_cache_initial_size  = 256;
 static const unsigned int dir_data_names_initial_size  = 64;
 
+#ifdef WINE_IOS
+/* Server cache indexes belong to a Windows process, not the host process.
+ * All threads of a pseudo-process must share its scan positions. */
+struct ios_dir_cache
+{
+    struct ios_dir_cache *next;
+    void *peb;
+    struct dir_data **entries;
+    unsigned int size;
+};
+static struct ios_dir_cache *ios_dir_caches;
+#else
 static struct dir_data **dir_data_cache;
 static unsigned int dir_data_cache_size;
+#endif
 
 static BOOL show_dot_files;
 static mode_t start_umask;
@@ -582,6 +595,53 @@ static void free_dir_data( struct dir_data *data )
     free( data->mask.Buffer );
     free( data );
 }
+
+#ifdef WINE_IOS
+/* Child boot runs before it has a TEB. Serialize its host cwd change with
+ * enumeration's opendir(".") / relative stat / cwd restoration sequence. */
+int ios_set_child_unix_cwd( int fd )
+{
+    int ret, error;
+    pthread_mutex_lock( &dir_mutex );
+    ret = fchdir( fd );
+    error = errno;
+    pthread_mutex_unlock( &dir_mutex );
+    errno = error;
+    return ret;
+}
+
+/* Caller holds dir_mutex, including throughout each enumeration. */
+static struct ios_dir_cache *ios_get_dir_cache( void )
+{
+    void *peb = NtCurrentTeb()->Peb;
+    struct ios_dir_cache *cache;
+    for (cache = ios_dir_caches; cache; cache = cache->next)
+        if (cache->peb == peb) return cache;
+    if (!(cache = calloc( 1, sizeof(*cache) ))) return NULL;
+    cache->peb = peb;
+    cache->next = ios_dir_caches;
+    ios_dir_caches = cache;
+    return cache;
+}
+
+void ios_dir_cache_release( void *peb )
+{
+    struct ios_dir_cache **link, *cache;
+    unsigned int i;
+    pthread_mutex_lock( &dir_mutex );
+    for (link = &ios_dir_caches; (cache = *link); link = &cache->next)
+        if (cache->peb == peb)
+        {
+            *link = cache->next;
+            for (i = 0; i < cache->size; i++) free_dir_data( cache->entries[i] );
+            free( cache->entries );
+            free( cache );
+            break;
+        }
+    pthread_mutex_unlock( &dir_mutex );
+}
+#endif
+
 
 
 /* support for a directory queue for filesystem searches */
@@ -2828,6 +2888,12 @@ static unsigned int get_cached_dir_data( HANDLE handle, struct dir_data **data_r
     int entry = -1, free_entries[16];
     unsigned int status;
     BOOLEAN fresh_handle;
+#ifdef WINE_IOS
+    struct ios_dir_cache *cache = ios_get_dir_cache();
+    if (!cache) return STATUS_NO_MEMORY;
+#define dir_data_cache (cache->entries)
+#define dir_data_cache_size (cache->size)
+#endif
 
     SERVER_START_REQ( get_directory_cache_entry )
     {
@@ -2885,6 +2951,11 @@ static unsigned int get_cached_dir_data( HANDLE handle, struct dir_data **data_r
     if (restart_scan && *data_ret) (*data_ret)->pos = 0;
     return status;
 }
+#ifdef WINE_IOS
+#undef dir_data_cache
+#undef dir_data_cache_size
+#endif
+
 
 
 /******************************************************************************
@@ -2897,8 +2968,14 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
 {
     int cwd, fd, needs_close;
     enum server_fd_type type;
-    struct dir_data *data;
+    struct dir_data *data = NULL;
     unsigned int status;
+#ifdef WINE_IOS
+    sigset_t sigset;
+    char content_path[PATH_MAX];
+    BOOL trace_content = FALSE;
+    unsigned int returned = 0;
+#endif
 
     TRACE("(%p %p %p %p %p %p 0x%08x 0x%08x 0x%08x %s 0x%08x\n",
           handle, event, apc_routine, apc_context, io, buffer,
@@ -2945,10 +3022,20 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
         return STATUS_INVALID_PARAMETER;
     }
 
+#ifdef WINE_IOS
+    if (fcntl( fd, F_GETPATH, content_path ) != -1)
+        trace_content = strcasestr( content_path, "/Content" ) != NULL;
+#endif
     io->Information = 0;
     if (mask && mask->Length == 0) mask = NULL;
 
+#ifdef WINE_IOS
+    /* A closed server pipe must not strand this shared lock or the temporary
+     * Unix cwd. Defer thread exit until both have been restored. */
+    server_enter_uninterrupted_section( &dir_mutex, &sigset );
+#else
     mutex_lock( &dir_mutex );
+#endif
 
     cwd = open( ".", O_RDONLY );
     if (fchdir( fd ) != -1)
@@ -2959,7 +3046,20 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
 
             while (!status && data->pos < data->count)
             {
+#ifdef WINE_IOS
+                ULONG_PTR before = io->Information;
+#endif
                 status = get_dir_data_entry( data, buffer, io, length, info_class, &last_info );
+#ifdef WINE_IOS
+                if (io->Information != before)
+                {
+                    returned++;
+                    if (trace_content && !strcasecmp( data->names[data->pos].unix_name, "PixelShader.xnb" ))
+                        ERR( "[content-enum] pid=%lx handle=%p returned name=%s\n",
+                             (unsigned long)GetCurrentProcessId(), handle,
+                             debugstr_w(data->names[data->pos].long_name) );
+                }
+#endif
                 if (!status || status == STATUS_BUFFER_OVERFLOW) data->pos++;
                 if (single_entry && last_info) break;
             }
@@ -2972,11 +3072,24 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
     else status = errno_to_status( errno );
 
     if (status != STATUS_NO_SUCH_FILE) io->Status = status;
+#ifdef WINE_IOS
+    if (trace_content)
+        ERR( "[content-enum] pid=%lx peb=%p handle=%p path=%s mask=%s cached_mask=%s class=%u single=%u restart=%u length=%lu status=%08x bytes=%lu returned=%u cached=%u pos=%u\n",
+             (unsigned long)GetCurrentProcessId(), NtCurrentTeb()->Peb, handle, content_path,
+             debugstr_us(mask), data ? debugstr_us(&data->mask) : "(none)", info_class,
+             single_entry, restart_scan, (unsigned long)length, status,
+             (unsigned long)io->Information, returned, data ? data->count : 0, data ? data->pos : 0 );
+#endif
 
+#ifndef WINE_IOS
     mutex_unlock( &dir_mutex );
+#endif
 
     if (needs_close) close( fd );
     if (cwd != -1) close( cwd );
+#ifdef WINE_IOS
+    server_leave_uninterrupted_section( &dir_mutex, &sigset );
+#endif
     TRACE( "=> %x (%ld)\n", status, io->Information );
     return status;
 }
@@ -4678,6 +4791,66 @@ static void ios_video_read_note( HANDLE h, unsigned int status, UINT got, LARGE_
 }
 #endif
 
+#ifdef WINE_IOS
+/* MADEIRA_IO_TRACE=<part of a file name>: every read, position query and seek on
+ * matching files, with the file position after each. Super Meat Boy's streamed
+ * music read 60 bytes too far into gameaudio.dat (102400 where 102340 was used);
+ * this shows which call moved it. Off unless set; one getenv, then one load per call. */
+static int ios_iot_state;                 /* 0 unknown, 1 on, -1 off */
+static char ios_iot_pattern[64];
+static HANDLE ios_iot_handles[8];
+static unsigned int ios_iot_count;
+
+static int ios_iot_enabled(void)
+{
+    if (!ios_iot_state)
+    {
+        const char *v = getenv( "MADEIRA_IO_TRACE" );
+        int i;
+        if (v && *v)
+        {
+            for (i = 0; v[i] && i < (int)sizeof(ios_iot_pattern) - 1; i++)
+                ios_iot_pattern[i] = (v[i] >= 'A' && v[i] <= 'Z') ? v[i] + 32 : v[i];
+            ios_iot_pattern[i] = 0;
+            ios_iot_state = 1;
+        }
+        else ios_iot_state = -1;
+    }
+    return ios_iot_state > 0;
+}
+
+static void ios_iot_open( HANDLE h, const WCHAR *name, int len )
+{
+    char nm[256];
+    int i, o = 0;
+    if (!ios_iot_enabled()) return;
+    for (i = 0; i < len && o < (int)sizeof(nm) - 1; i++)
+    {
+        WCHAR c = name[i];
+        nm[o++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    nm[o] = 0;
+    if (!strstr( nm, ios_iot_pattern )) return;
+    for (i = 0; i < 8; i++) if (!ios_iot_handles[i]) { ios_iot_handles[i] = h; break; }
+    ERR( "[io-trace] open handle=%p %s\n", h, nm );
+}
+
+static int ios_iot_tracked( HANDLE h )
+{
+    int i;
+    if (ios_iot_state <= 0) return 0;
+    for (i = 0; i < 8; i++) if (ios_iot_handles[i] == h) return 1;
+    return 0;
+}
+
+static void ios_iot_note( HANDLE h, const char *what, long long a, long long b, long long c, unsigned int status, int fd )
+{
+    long long pos = fd >= 0 ? (long long)lseek( fd, 0, SEEK_CUR ) : -1;
+    if (!ios_iot_tracked( h ) || ++ios_iot_count > 4000) return;
+    ERR( "[io-trace] %s handle=%p %lld %lld %lld status=%08x pos-after=%lld\n", what, h, a, b, c, status, pos );
+}
+#endif
+
 NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
                               IO_STATUS_BLOCK *io, LARGE_INTEGER *alloc_size,
                               ULONG attributes, ULONG sharing, ULONG disposition,
@@ -4804,6 +4977,7 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
                 ios_video_track_open( *handle, b, n );
             }
         }
+        ios_iot_open( *handle, b, n );
     }
     /* iOS-Madeira ml665: [file-fail] — we have NEVER logged a failing guest file
      * open, and that blind spot cost several runs on Book of the Dead.
@@ -5271,6 +5445,9 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             off_t res = lseek( fd, 0, SEEK_CUR );
             if (res == (off_t)-1) status = errno_to_status( errno );
             else info->CurrentByteOffset.QuadPart = res;
+#ifdef WINE_IOS
+            if (ios_iot_state > 0) ios_iot_note( handle, "query-pos", (long long)res, 0, 0, status, fd );
+#endif
         }
         break;
     case FileInternalInformation:
@@ -5444,6 +5621,9 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
             if (lseek( fd, info->CurrentByteOffset.QuadPart, SEEK_SET ) == (off_t)-1)
                 status = errno_to_status( errno );
+#ifdef WINE_IOS
+            if (ios_iot_state > 0) ios_iot_note( handle, "set-pos", (long long)info->CurrentByteOffset.QuadPart, 0, 0, status, fd );
+#endif
 
             if (needs_close) close( fd );
         }
@@ -6672,6 +6852,8 @@ done:
     if (status == STATUS_SUCCESS && total)
         ios_js_read_note( handle, unix_handle, buffer, length, total, offset );
     ios_video_read_note( handle, status, total, offset );
+    if (ios_iot_state > 0)
+        ios_iot_note( handle, "read want/got/offset", length, total, offset ? (long long)offset->QuadPart : -1LL, status, unix_handle );
 #endif
     send_completion = cvalue != 0;
 
@@ -6733,11 +6915,13 @@ NTSTATUS WINAPI NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE ap
 
     while (length)
     {
+        /* as in NtReadFile: virtual_locked_* also fill buffers the kernel cannot write directly */
         if (offset && offset->QuadPart != FILE_USE_FILE_POINTER_POSITION)
-            result = pread( unix_handle, (char *)segments->Buffer + pos,
-                            min( length - pos, page_size - pos ), offset->QuadPart + total );
+            result = virtual_locked_pread( unix_handle, (char *)segments->Buffer + pos,
+                                           min( length - pos, page_size - pos ), offset->QuadPart + total );
         else
-            result = read( unix_handle, (char *)segments->Buffer + pos, min( length - pos, page_size - pos ) );
+            result = virtual_locked_read( unix_handle, (char *)segments->Buffer + pos,
+                                          min( length - pos, page_size - pos ) );
 
         if (result == -1)
         {

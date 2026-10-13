@@ -159,7 +159,16 @@ typedef struct _wine_modref
     struct file_id        id;
     ULONG                 CheckSum;
     BOOL                  system;
+    LIST_ENTRY            failed_import_entry;
+    NTSTATUS              import_status;
+    BYTE                 *resolved_imports;
 } WINE_MODREF;
+
+/* Import failures retain one image per file, outside the public module lists.
+ * Dependencies can already point into it (including cycles), so freeing its
+ * image or executable copy here is unsafe. Retry that image instead of leaking
+ * another mapping, TLS slot and JIT copy on every LoadLibrary attempt. */
+static LIST_ENTRY failed_import_modules = { &failed_import_modules, &failed_import_modules };
 
 static UINT tls_module_count = 32;     /* number of modules with TLS directory */
 static IMAGE_TLS_DIRECTORY *tls_dirs;  /* array of TLS directories */
@@ -1828,7 +1837,7 @@ static NTSTATUS fixup_imports_ilonly( WINE_MODREF *wm, LPCWSTR load_path, void *
     if (!(wm->ldr.Flags & LDR_DONT_RESOLVE_REFS)) return STATUS_SUCCESS;  /* already done */
     wm->ldr.Flags &= ~LDR_DONT_RESOLVE_REFS;
 
-    assert( !wm->ldr.DdagNode->Dependencies.Tail );
+    /* A retained import failure may already have an mscoree dependency. */
     if (!(status = load_dll( load_path, L"mscoree.dll", 0, &imp, FALSE ))
           && !add_module_dependency_after( wm->ldr.DdagNode, imp->ldr.DdagNode, NULL ))
         status = STATUS_NO_MEMORY;
@@ -1883,7 +1892,11 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
 
     if (!nb_imports) return STATUS_SUCCESS;  /* no imports */
 
-    if (!create_module_activation_context( &wm->ldr ))
+    if (!wm->resolved_imports &&
+        !(wm->resolved_imports = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, nb_imports )))
+        return STATUS_NO_MEMORY;
+
+    if (wm->ldr.ActivationContext || !create_module_activation_context( &wm->ldr ))
         RtlActivateActivationContext( 0, wm->ldr.ActivationContext, &cookie );
 
     /* load the imported modules. They are automatically
@@ -1892,11 +1905,19 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
     status = STATUS_SUCCESS;
     for (i = 0; i < nb_imports; i++)
     {
+        /* Do not bind a successful descriptor twice. With OriginalFirstThunk
+         * absent its FirstThunk already contains function pointers, not names.
+         * This also avoids duplicate dependency references and stub allocations. */
+        if (wm->resolved_imports[i]) continue;
         dep_after = wm->ldr.DdagNode->Dependencies.Tail;
         if (!import_dll( wm, &imports[i], load_path, &imp ))
             status = STATUS_DLL_NOT_FOUND;
-        else if (imp && imp->ldr.DdagNode != node_ntdll && imp->ldr.DdagNode != node_kernel32)
-            add_module_dependency_after( wm->ldr.DdagNode, imp->ldr.DdagNode, dep_after );
+        else
+        {
+            wm->resolved_imports[i] = 1;
+            if (imp && imp->ldr.DdagNode != node_ntdll && imp->ldr.DdagNode != node_kernel32)
+                add_module_dependency_after( wm->ldr.DdagNode, imp->ldr.DdagNode, dep_after );
+        }
     }
     if (wm->ldr.ActivationContext) RtlDeactivateActivationContext( 0, cookie );
     return status;
@@ -2186,6 +2207,8 @@ static NTSTATUS process_attach( LDR_DDAG_NODE *node, LPVOID lpReserved )
 
     mod = CONTAINING_RECORD( node->Modules.Flink, LDR_DATA_TABLE_ENTRY, NodeModuleLink );
     wm = CONTAINING_RECORD( mod, WINE_MODREF, ldr );
+
+    if (wm->import_status) return wm->import_status;
 
     /* Skip initialization entirely if requested */
     if (wm->ldr.Flags & LDR_DONT_RESOLVE_REFS)
@@ -2850,6 +2873,82 @@ done:
 }
 
 
+/* Called under loader_section; keep failed images out of every public lookup.
+ * Retain the dependency graph, TLS and activation context for a safe retry. */
+static void retain_failed_import_module( WINE_MODREF *wm, NTSTATUS status )
+{
+    RemoveEntryList( &wm->ldr.InLoadOrderLinks );
+    RemoveEntryList( &wm->ldr.InMemoryOrderLinks );
+    RemoveEntryList( &wm->ldr.HashLinks );
+    RtlRbRemoveNode( &base_address_index_tree, &wm->ldr.BaseAddressIndexNode );
+    if (cached_modref == wm) cached_modref = NULL;
+    wm->import_status = status;
+    wm->ldr.Flags |= LDR_DONT_RESOLVE_REFS;
+    InsertTailList( &failed_import_modules, &wm->failed_import_entry );
+}
+
+static WINE_MODREF *find_failed_import_module( const UNICODE_STRING *nt_name,
+                                              const struct file_id *id )
+{
+    static const struct file_id no_id;
+    UNICODE_STRING name = *nt_name;
+    LIST_ENTRY *entry;
+    WINE_MODREF *wm;
+
+    name.Buffer += 4;
+    name.Length -= 4 * sizeof(WCHAR);
+    for (entry = failed_import_modules.Flink; entry != &failed_import_modules; entry = entry->Flink)
+    {
+        wm = CONTAINING_RECORD( entry, WINE_MODREF, failed_import_entry );
+        if (id && memcmp( id, &no_id, sizeof(*id) ))
+        {
+            if (!memcmp( &wm->id, id, sizeof(*id) )) return wm;
+        }
+        else if (RtlEqualUnicodeString( &name, &wm->ldr.FullDllName, TRUE )) return wm;
+    }
+    return NULL;
+}
+
+static NTSTATUS retry_failed_import_module( WINE_MODREF *wm, LPCWSTR load_path )
+{
+    NTSTATUS status;
+    static unsigned int reports;
+
+    RemoveEntryList( &wm->failed_import_entry );
+    InsertTailList( &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList, &wm->ldr.InLoadOrderLinks );
+    InsertTailList( &NtCurrentTeb()->Peb->LdrData->InMemoryOrderModuleList, &wm->ldr.InMemoryOrderLinks );
+    InsertTailList( &hash_table[hash_basename( &wm->ldr.BaseDllName )], &wm->ldr.HashLinks );
+    rtl_rb_tree_put( &base_address_index_tree, wm->ldr.DllBase,
+                     &wm->ldr.BaseAddressIndexNode, base_address_compare );
+    /* Publish temporarily during resolution so circular imports find this
+     * same image. No initialization is allowed until resolution succeeds. */
+    wm->import_status = STATUS_SUCCESS;
+    if (wm->ldr.Flags & LDR_COR_ILONLY)
+        status = fixup_imports_ilonly( wm, load_path, &wm->ldr.EntryPoint );
+    else
+        status = fixup_imports( wm, load_path );
+    if (status) retain_failed_import_module( wm, status );
+    if (reports++ < 16)
+        ERR( "[import-retry] reused %s base=%p status=%lx (no new image or TLS slot)\n",
+             debugstr_w(wm->ldr.FullDllName.Buffer), wm->ldr.DllBase, status );
+    return status;
+}
+
+static void complete_loaded_module( WINE_MODREF *wm )
+{
+    BOOL is_builtin = !!(wm->ldr.Flags & LDR_WINE_INTERNAL);
+    HMODULE module = wm->ldr.DllBase;
+
+    if (is_builtin)
+    {
+        if (TRACE_ON(relay)) RELAY_SetupDLL( module );
+    }
+    else if ((wm->ldr.Flags & LDR_IMAGE_IS_DLL) && TRACE_ON(snoop)) SNOOP_SetupDLL( module );
+    TRACE_(loaddll)( "Loaded %s at %p: %s\n", debugstr_w(wm->ldr.FullDllName.Buffer), module,
+                     is_builtin ? "builtin" : "native" );
+    wm->ldr.LoadCount = 1;
+}
+
 /*************************************************************************
  *		build_module
  *
@@ -2899,19 +2998,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
             status = fixup_imports( wm, load_path );
         if (status != STATUS_SUCCESS)
         {
-            /* the module has only be inserted in the load & memory order lists */
-            RemoveEntryList(&wm->ldr.InLoadOrderLinks);
-            RemoveEntryList(&wm->ldr.InMemoryOrderLinks);
-            RemoveEntryList(&wm->ldr.HashLinks);
-            RtlRbRemoveNode( &base_address_index_tree, &wm->ldr.BaseAddressIndexNode );
-
-            /* FIXME: there are several more dangling references
-             * left. Including dlls loaded by this dll before the
-             * failed one. Unrolling is rather difficult with the
-             * current structure and we can leave them lying
-             * around with no problems, so we don't care.
-             * As these might reference our wm, we don't free it.
-             */
+            retain_failed_import_module( wm, status );
             *module = NULL;
             return status;
         }
@@ -2919,19 +3006,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
 
     TRACE( "loaded %s %p %p\n", debugstr_us(nt_name), wm, *module );
 
-    if (is_builtin)
-    {
-        if (TRACE_ON(relay)) RELAY_SetupDLL( *module );
-    }
-    else
-    {
-        if ((wm->ldr.Flags & LDR_IMAGE_IS_DLL) && TRACE_ON(snoop)) SNOOP_SetupDLL( *module );
-    }
-
-    TRACE_(loaddll)( "Loaded %s at %p: %s\n", debugstr_w(wm->ldr.FullDllName.Buffer), *module,
-                     is_builtin ? "builtin" : "native" );
-
-    wm->ldr.LoadCount = 1;
+    complete_loaded_module( wm );
     *pwm = wm;
     *module = NULL;
     return STATUS_SUCCESS;
@@ -3410,9 +3485,25 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
                                  DWORD flags, BOOL system, BOOL redirected, WINE_MODREF** pwm )
 {
     void *module = NULL;
+    WINE_MODREF *failed;
     SIZE_T len = 0;
-    NTSTATUS status = NtMapViewOfSection( mapping, NtCurrentProcess(), &module, 0, 0, NULL, &len,
-                                          ViewShare, 0, PAGE_EXECUTE_READ );
+    NTSTATUS status;
+
+    /* Search still opens the current file and obtains its identity. Replacing
+     * it therefore does not adopt a failed image from the old file. */
+    if (!(flags & LDR_DONT_RESOLVE_REFS) && (failed = find_failed_import_module( nt_name, id )))
+    {
+        if ((status = retry_failed_import_module( failed, load_path )))
+        {
+            *pwm = NULL;
+            return status;
+        }
+        complete_loaded_module( failed );
+        *pwm = failed;
+        goto loaded;
+    }
+    status = NtMapViewOfSection( mapping, NtCurrentProcess(), &module, 0, 0, NULL, &len,
+                                ViewShare, 0, PAGE_EXECUTE_READ );
 
     if (!NT_SUCCESS(status)) return status;
 
@@ -3431,6 +3522,7 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
 #endif
     if (NT_SUCCESS(status)) status = build_module( load_path, nt_name, &module, image_info, id,
                                                    flags, system, redirected, pwm );
+loaded:
 #ifdef __arm64ec__
     /* iOS-Madeira ml709: tell the emulator this image's code is executable, here rather
      * than relying on NtMapViewOfSection's notification -- that one never fires in a
@@ -5130,6 +5222,7 @@ static void free_modref( WINE_MODREF *wm )
     NtUnmapViewOfSection( NtCurrentProcess(), wm->ldr.DllBase );
     if (cached_modref == wm) cached_modref = NULL;
     RtlFreeUnicodeString( &wm->ldr.FullDllName );
+    RtlFreeHeap( GetProcessHeap(), 0, wm->resolved_imports );
     RtlFreeHeap( GetProcessHeap(), 0, wm );
 }
 

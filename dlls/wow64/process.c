@@ -947,11 +947,22 @@ NTSTATUS WINAPI wow64_NtResumeProcess( UINT *args )
 /**********************************************************************
  *           wow64_NtResumeThread
  */
+/* CPU hooks are local-process only. Preserve native self-suspend semantics. */
+static BOOL is_other_local_thread( HANDLE handle )
+{
+    THREAD_BASIC_INFORMATION info;
+    return !NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL ) &&
+           info.ClientId.UniqueProcess == NtCurrentTeb()->ClientId.UniqueProcess &&
+           info.ClientId.UniqueThread != NtCurrentTeb()->ClientId.UniqueThread;
+}
+
 NTSTATUS WINAPI wow64_NtResumeThread( UINT *args )
 {
     HANDLE handle = get_handle( &args );
     ULONG *count = get_ptr( &args );
 
+    if (pBTCpuResumeLocalThread && is_other_local_thread( handle ))
+        return pBTCpuResumeLocalThread( handle, count );
     return NtResumeThread( handle, count );
 }
 
@@ -1183,6 +1194,8 @@ NTSTATUS WINAPI wow64_NtSuspendThread( UINT *args )
     HANDLE handle = get_handle( &args );
     ULONG *count = get_ptr( &args );
 
+    if (pBTCpuSuspendLocalThread && is_other_local_thread( handle ))
+        return pBTCpuSuspendLocalThread( handle, count );
     return NtSuspendThread( handle, count );
 }
 

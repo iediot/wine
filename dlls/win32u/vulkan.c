@@ -1113,6 +1113,33 @@ static VkResult win32u_vkGetMemoryWin32HandlePropertiesKHR( VkDevice client_devi
     return VK_SUCCESS;
 }
 
+#ifdef WINE_IOS
+/* Raw stderr survives Madeira's quiet Wine-channel filter. Every failed map is
+ * logged; successful ones only for the first 64 and then one in 100,000 (ml1313).
+ * Logging each map (with a virtual-memory query) cost Detroit: Become Human about
+ * 6,400 lines and queries a second - 1,026,295 lines in 160 s over 33 memory objects
+ * the game maps again and again. */
+static void ios_vulkan_note_map( struct device_memory *memory, const VkMemoryMapInfoKHR *info,
+                                VkResult result, void *data, const char *path )
+{
+    static LONG maps;
+    MEMORY_BASIC_INFORMATION mbi = {0};
+    NTSTATUS status;
+    LONG n = InterlockedIncrement( &maps );
+    if (result == VK_SUCCESS && n > 64 && n % 100000) return;
+    status = data ? NtQueryVirtualMemory( GetCurrentProcess(), data, MemoryBasicInformation,
+                                                   &mbi, sizeof(mbi), NULL ) : STATUS_INVALID_PARAMETER;
+    fprintf( stderr, "[vulkan-map] tid=%04x memory=%#llx host=%#llx offset=%#llx size=%#llx "
+             "allocation=%#llx path=%s result=%d ptr=%p query=%#x base=%p region=%#lx state=%#lx protect=%#lx\n",
+             (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+             (unsigned long long)info->memory, (unsigned long long)memory->obj.host.device_memory,
+             (unsigned long long)info->offset, (unsigned long long)info->size,
+             (unsigned long long)memory->size, path, result, data, (unsigned)status,
+             mbi.BaseAddress, (unsigned long)mbi.RegionSize, (unsigned long)mbi.State,
+             (unsigned long)mbi.Protect );
+}
+#endif
+
 static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMapInfoKHR *map_info, void **data )
 {
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
@@ -1130,6 +1157,9 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
     {
         *data = (char *)memory->vm_map + info.offset;
         TRACE( "returning %p\n", *data );
+#ifdef WINE_IOS
+        ios_vulkan_note_map( memory, map_info, VK_SUCCESS, *data, "wine-vm" );
+#endif
         return VK_SUCCESS;
     }
 
@@ -1183,6 +1213,10 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
     }
 #endif
 
+#ifdef WINE_IOS
+    ios_vulkan_note_map( memory, map_info, res, res == VK_SUCCESS ? *data : NULL,
+                         placed_info.pPlacedAddress ? "placed" : "driver" );
+#endif
     return res;
 }
 

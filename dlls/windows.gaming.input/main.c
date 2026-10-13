@@ -26,6 +26,7 @@
 #include "winreg.h"
 #include "winuser.h"
 
+#include "winternl.h"
 #include "dbt.h"
 #include "ddk/hidclass.h"
 #include "ddk/hidsdi.h"
@@ -142,6 +143,14 @@ static DWORD WINAPI monitor_thread_proc( void *param )
     return 0;
 }
 
+/* Whether this thread holds the loader lock (it is inside a DllMain or a TLS
+ * callback, for instance a native plugin's static constructor). */
+static BOOL loader_lock_held(void)
+{
+    RTL_CRITICAL_SECTION *cs = NtCurrentTeb()->Peb->LoaderLock;
+    return cs && cs->OwningThread == ULongToHandle( GetCurrentThreadId() );
+}
+
 static BOOL WINAPI start_monitor_thread( INIT_ONCE *once, void *param, void **context )
 {
     HANDLE thread, start_event;
@@ -151,6 +160,18 @@ static BOOL WINAPI start_monitor_thread( INIT_ONCE *once, void *param, void **co
 
     thread = CreateThread( NULL, 0, monitor_thread_proc, start_event, 0, NULL );
     if (!thread) ERR( "Failed to create monitor thread, error %lu\n", GetLastError() );
+    else if (loader_lock_held())
+    {
+        /* A new thread takes the loader lock to start, so waiting for it here never
+         * ends: Party Animals asks for Windows.Gaming.Input.Gamepad with the lock held
+         * and hung at start-up (three threads blocked on loader_section owned by the
+         * main thread). Let it start once the lock is released; controllers it finds
+         * arrive as GamepadAdded/RawGameControllerAdded, as hot-plugged ones do. The
+         * event stays open: the thread still signals it. */
+        WARN( "loader lock held: not waiting for the monitor thread\n" );
+        CloseHandle( thread );
+        return TRUE;
+    }
     else
     {
         WaitForSingleObject( start_event, INFINITE );

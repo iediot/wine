@@ -346,3 +346,6 @@ extern void put_vm_counters( VM_COUNTERS_EX32 *info32, const VM_COUNTERS_EX *inf
                              ULONG size );
 
 #endif /* __WOW64_PRIVATE_H */
+
+extern NTSTATUS (WINAPI *pBTCpuSuspendLocalThread)( HANDLE, ULONG * );
+extern NTSTATUS (WINAPI *pBTCpuResumeLocalThread)( HANDLE, ULONG * );

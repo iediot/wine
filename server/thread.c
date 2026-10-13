@@ -134,8 +134,8 @@ struct context
     unsigned int            status;     /* status of the context */
     struct context_data     regs[2];    /* context data */
 #ifdef WINE_IOS
-    int                     ios_snapshot; /* WoW64: filled by a Mach capture, not by the thread */
-    int                     ios_dirty;    /* WoW64: a SetThreadContext waits for resume_thread() */
+    int                     ios_snapshot; /* filled by a Mach capture, not by the thread */
+    int                     ios_dirty;    /* a SetThreadContext waits for resume_thread() */
 #endif
 };
 #define CTX_NATIVE  0  /* context for native machine */
@@ -980,23 +980,32 @@ static void set_thread_info( struct thread *thread,
 }
 
 #ifdef WINE_IOS
-/* Thread contexts of WoW64 processes (iOS)
+/* Thread contexts on iOS
  *
  * This host has no signal-based suspend: stop_thread() takes a Mach snapshot
  * (ios_fill_thread_context) and, unless MADEIRA_REAL_SUSPEND is set, the
  * target keeps running while the server's suspend count goes up.  Upstream's
  * release sites for a cached context (the select suspend-context handback)
- * never fire either, so for 64-bit processes the first snapshot answers every
- * later GetThreadContext and a SetThreadContext only updates that cache.
- * That upstream behaviour is kept unchanged for 64-bit processes.
+ * never fire either, so without a refresh the first snapshot would answer every
+ * later GetThreadContext for the rest of the thread's life.
  *
- * For WoW64 (i386) processes -- managed runtimes' stop-the-world collectors
- * suspend, read, sometimes redirect and resume their threads -- the context
- * follows the thread instead:
+ * Managed runtimes' stop-the-world collectors suspend, read and resume their
+ * threads on every collection, so the context has to follow the thread:
  *
- *  - every stop_thread() on a suspended thread re-captures a snapshot context
- *    (never one the thread filled in for itself, and never one that holds a
- *    pending SetThreadContext);                       MADEIRA_CTX_REFRESH=0
+ *  - every stop_thread() that finds a context already cached (a SuspendThread,
+ *    a process suspend, or a GetThreadContext) re-captures the snapshot (never
+ *    one the thread filled in for itself, and never one pinned by a pending
+ *    SetThreadContext), for 64-bit and WoW64 processes alike.
+ *    MADEIRA_CTX_REFRESH=0 keeps the first snapshot.
+ *    A stale snapshot is not harmless for 64-bit processes: with the syscall
+ *    frame substituted (MADEIRA_CTX_FRAME, mach_ios.c) its sp lies inside the
+ *    thread's stack, so Mono's Boehm collector scanned from that old sp and
+ *    missed every frame pushed since the first capture, then freed objects
+ *    those frames still referenced (RimWorld, 2026-10-06: null fields that are
+ *    never null, garbage array lengths, jumps into collected dynamic methods).
+ *
+ * WoW64 (i386) processes also get:
+ *
  *  - a thread created suspended reports its own start context instead of a
  *    snapshot of a half-initialised thread;           MADEIRA_CTX_START_WAIT=0
  *  - SetThreadContext is refused on a running thread; on a suspended one it
@@ -1018,7 +1027,7 @@ extern int ios_apply_resume_context( struct thread *thread, const struct context
 
 static int ctx_refresh = -1, ctx_start_wait = -1, ctx_set = -1;
 
-/* default-on switches for WoW64 processes; "0" disables */
+/* default-on switches; "0" disables */
 static int ios_ctx_switch( int *cache, const char *name )
 {
     if (*cache < 0)
@@ -1034,9 +1043,19 @@ static int ios_wow_ctx_set_on( struct thread *thread )
     return ios_process_is_wow64( thread->process ) && ios_ctx_switch( &ctx_set, "MADEIRA_CTX_SET" );
 }
 
-/* re-capture a WoW64 thread's snapshot context (stop_thread on an existing context) */
-static void ios_wow_ctx_refresh( struct thread *thread )
+/* A SetThreadContext is applied to the cached context the caller read, without a
+ * re-capture first: always for 64-bit processes, which only cache it, and for WoW64
+ * ones while apply-on-resume is on.  Whether it also pins that context against
+ * refresh until resume is decided in set_thread_context. */
+static int ios_ctx_set_pins( struct thread *thread )
 {
+    return ios_process_is_wow64( thread->process ) ? ios_wow_ctx_set_on( thread ) : 1;
+}
+
+/* re-capture a thread's snapshot context (stop_thread on an existing context) */
+static void ios_ctx_refresh( struct thread *thread )
+{
+    static unsigned int n_refresh;
     struct context_data fresh[2];
 
     if (!thread->context->ios_snapshot || thread->context->ios_dirty) return;
@@ -1048,6 +1067,10 @@ static void ios_wow_ctx_refresh( struct thread *thread )
     if (!ios_fill_thread_context( thread, &fresh[CTX_NATIVE], &fresh[CTX_WOW] )) return;
     thread->context->regs[CTX_NATIVE] = fresh[CTX_NATIVE];
     thread->context->regs[CTX_WOW]    = fresh[CTX_WOW];
+    /* aggregate, like ml730: the count is what tells whether refresh ran at all */
+    if (++n_refresh <= 8 || n_refresh % 256 == 0)
+        fprintf( stderr, "[ctx-refresh] #%u tid=%04x %s\n", n_refresh, thread->id,
+                 ios_process_is_wow64( thread->process ) ? "wow64" : "x64" );
     /* A capture that failed the first time (process init not finished, no
      * Mach port yet) left the context PENDING; a later one completes it. */
     if (thread->context->status == STATUS_PENDING)
@@ -1077,20 +1100,20 @@ void stop_thread( struct thread *thread )
 #ifdef WINE_IOS
     if (thread->context)
     {
-        /* WoW64 processes: a cached Mach snapshot is not a context (see below) */
-        if (ios_process_is_wow64( thread->process )) ios_wow_ctx_refresh( thread );
+        /* a cached Mach snapshot is not a context (see "Thread contexts on iOS") */
+        ios_ctx_refresh( thread );
         return;
     }
 #endif
     if (thread->context) return;  /* already suspended, no need for a signal */
     if (!(thread->context = create_thread_context( thread ))) return;
 #ifdef WINE_IOS
+    /* Mark it refreshable BEFORE the first capture, so a capture that fails
+     * (no port yet, init not finished) does not wedge the context in
+     * STATUS_PENDING for the rest of the thread's life. */
+    thread->context->ios_snapshot = 1;
     if (ios_process_is_wow64( thread->process ))
     {
-        /* Mark it refreshable BEFORE the first capture, so a capture that fails
-         * (no port yet, init not finished) does not wedge the context in
-         * STATUS_PENDING for the rest of the thread's life. */
-        thread->context->ios_snapshot = 1;
         /* A thread still starting up reports its own context: leave it PENDING,
          * exactly as upstream does before the target stops.  The reader waits on
          * the context sync and receives what the thread posts from
@@ -1220,8 +1243,14 @@ int resume_thread( struct thread *thread )
             resume_delayed_debug_events( thread );
 #ifdef WINE_IOS
             /* WoW64: apply a SetThreadContext made while suspended, while a
-             * persistent Mach hold (if any) still stops the thread. */
-            if (thread->context && thread->context->ios_dirty) ios_wow_ctx_apply( thread );
+             * persistent Mach hold (if any) still stops the thread.  64-bit:
+             * it only ever lived in the cache, as upstream; release the pin so
+             * the next stop re-captures. */
+            if (thread->context && thread->context->ios_dirty)
+            {
+                if (ios_process_is_wow64( thread->process )) ios_wow_ctx_apply( thread );
+                else thread->context->ios_dirty = 0;
+            }
             {   /* ml730: final logical resume releases exactly one physical hold */
                 extern int ios_thread_mach_release( struct thread * );
                 ios_thread_mach_release( thread );
@@ -2395,6 +2424,56 @@ DECL_HANDLER(resume_thread)
 }
 
 /* select on a handle list */
+#ifdef WINE_IOS
+#include <stdio.h>
+/* [wait-census] (MADEIRA_PERF=1): which thread waits on which object, by type and
+ * name, how often and with what timeout. A game that polls (waits with a timeout,
+ * wakes, waits again) never shows in [srv-stuck], which only reports long waits;
+ * Detroit: Become Human's 98% stall was such a loop. Every 20000 waits the top
+ * entries are printed and the table starts over. */
+static void ios_wait_census( const union select_op *op, data_size_t op_size, abstime_t timeout )
+{
+    static int enabled = -1;
+    static struct { thread_id_t tid; char what[96]; unsigned n; int timed; } table[64];
+    static unsigned used, total;
+    struct object *obj;
+    char what[96];
+    unsigned i;
+
+    if (enabled < 0) { const char *e = getenv( "MADEIRA_PERF" ); enabled = e && *e == '1'; }
+    if (!enabled) return;
+    if ((op->op != SELECT_WAIT && op->op != SELECT_WAIT_ALL) || op_size < sizeof(op->wait.op) + sizeof(obj_handle_t)) return;
+    if (!(obj = get_handle_obj( current->process, op->wait.handles[0], 0, NULL ))) { clear_error(); return; }
+    {
+        data_size_t len = 0, k, o = 0;
+        const WCHAR *name = get_object_name( obj, &len );
+        const struct unicode_str *type = obj->ops->type ? &obj->ops->type->name : NULL;
+        for (k = 0; type && k < type->len / sizeof(WCHAR) && o < 30; k++) what[o++] = (char)type->str[k];
+        what[o++] = ' ';
+        for (k = 0; name && k < len / sizeof(WCHAR) && o < sizeof(what) - 1; k++) what[o++] = name[k] < 128 ? (char)name[k] : '?';
+        if (!name || !len) { snprintf( what + o, sizeof(what) - o, "(unnamed %p)", obj ); o = strlen( what ); }
+        what[o < sizeof(what) ? o : sizeof(what) - 1] = 0;
+    }
+    release_object( obj );
+    for (i = 0; i < used; i++)
+        if (table[i].tid == current->id && !strcmp( table[i].what, what )) break;
+    if (i == used && used < 64) { table[used].tid = current->id; strcpy( table[used].what, what ); table[used].n = 0; used++; }
+    if (i < used) { table[i].n++; table[i].timed = timeout != TIMEOUT_INFINITE; }
+    if (++total % 20000) return;
+    fprintf( stderr, "[wait-census] last 20000 waits (first handle of each):\n" );
+    for (unsigned shown = 0; shown < 12; shown++)
+    {
+        unsigned best = used, j;
+        for (j = 0; j < used; j++) if (table[j].n && (best == used || table[j].n > table[best].n)) best = j;
+        if (best == used) break;
+        fprintf( stderr, "[wait-census]   %6u tid=%04x %s%s\n", table[best].n, table[best].tid,
+                 table[best].what, table[best].timed ? " (timed)" : "" );
+        table[best].n = 0;
+    }
+    used = 0;
+}
+#endif
+
 DECL_HANDLER(select)
 {
     union select_op select_op;
@@ -2454,6 +2533,10 @@ DECL_HANDLER(select)
         signal_sync( ctx->sync );
 #ifdef WINE_IOS
         current->ios_start_pending = 0;   /* it posted its start context */
+        /* The thread filled this context in itself: it is handed back to the thread on
+         * wakeup and must never be replaced by a Mach snapshot of the parked thread. */
+        ctx->ios_snapshot = 0;
+        ctx->ios_dirty    = 0;
 #endif
     }
 
@@ -2462,6 +2545,9 @@ DECL_HANDLER(select)
     op_size = min( req->size, sizeof(select_op) );
     memset( &select_op, 0, sizeof(select_op) );
     memcpy( &select_op, result + 1, op_size );
+#ifdef WINE_IOS
+    ios_wait_census( &select_op, op_size, req->timeout );
+#endif
 
     /* first store results of previous apc */
     if (req->prev_apc)
@@ -2721,6 +2807,15 @@ DECL_HANDLER(get_thread_context)
             native_flags = req->native_flags;
             wow_flags = req->flags & ~native_flags;
         }
+#ifdef WINE_IOS
+        if (thread_context->regs[CTX_WOW].machine == IMAGE_FILE_MACHINE_I386 &&
+            (wow_flags & ~thread_context->regs[CTX_WOW].flags))
+        {
+            set_error( STATUS_UNSUCCESSFUL );
+            release_object( thread_context );
+            return;
+        }
+#endif
         if ((context = set_reply_data_size( (!!native_flags + !!wow_flags) * sizeof(struct context_data) )))
         {
             if (native_flags)
@@ -2784,10 +2879,10 @@ DECL_HANDLER(set_thread_context)
         if (thread != current)
         {
 #ifdef WINE_IOS
-            /* WoW64: do not re-capture here.  The context the caller modified
-             * is the one its GetThreadContext returned, and ios_ctx_frame /
+            /* Do not re-capture here.  The context the caller modified is the
+             * one its GetThreadContext returned, and (WoW64) ios_ctx_frame /
              * ios_ctx_seq must keep describing that capture. */
-            if (!(ios_wow_ctx_set_on( thread ) && thread->context))
+            if (!(ios_ctx_set_pins( thread ) && thread->context))
 #endif
             stop_thread( thread );
         }
@@ -2822,8 +2917,14 @@ DECL_HANDLER(set_thread_context)
 #ifdef WINE_IOS
             /* A context the thread filled in for itself (it is parked in
              * wait_suspend()) is applied by the thread on resume, as upstream.
-             * A Mach snapshot is applied by resume_thread(). */
-            if (thread != current && ios_wow_ctx_set_on( thread ) && thread->context->ios_snapshot)
+             * A Mach snapshot is applied (WoW64) or released (64-bit) by
+             * resume_thread(), the only place a pin is cleared.  So a 64-bit
+             * Set pins only under a thread-level suspend: under a process-level
+             * one alone (suspend_process) or on a running thread nothing would
+             * ever release it, and the snapshot would go stale again. */
+            if (thread != current && ios_ctx_set_pins( thread ) && thread->context->ios_snapshot &&
+                (ios_process_is_wow64( thread->process ) ? is_thread_suspended( thread )
+                                                         : thread->suspend > 0))
                 thread->context->ios_dirty = 1;
 #endif
         }

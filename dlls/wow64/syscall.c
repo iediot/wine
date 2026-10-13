@@ -174,6 +174,8 @@ NTSTATUS (WINAPI *pBTCpuResetToConsistentState)( EXCEPTION_POINTERS * ) = NULL;
 void     (WINAPI *pBTCpuUpdateProcessorInformation)( SYSTEM_CPU_INFORMATION * ) = NULL;
 void     (WINAPI *pBTCpuProcessTerm)( HANDLE, BOOL, NTSTATUS ) = NULL;
 void     (WINAPI *pBTCpuThreadTerm)( HANDLE, LONG ) = NULL;
+NTSTATUS (WINAPI *pBTCpuSuspendLocalThread)( HANDLE, ULONG * ) = NULL;
+NTSTATUS (WINAPI *pBTCpuResumeLocalThread)( HANDLE, ULONG * ) = NULL;
 
 BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
 {
@@ -1188,6 +1190,8 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
     GET_PTR( BTCpuUpdateProcessorInformation );
     GET_PTR( BTCpuProcessTerm );
     GET_PTR( BTCpuThreadTerm );
+    GET_PTR( BTCpuSuspendLocalThread );
+    GET_PTR( BTCpuResumeLocalThread );
     GET_PTR( __wine_get_unix_opcode );
 
     module = load_64bit_module( L"wow64win.dll" );
@@ -1225,6 +1229,8 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
     XLATE_PTR( BTCpuUpdateProcessorInformation );
     XLATE_PTR( BTCpuProcessTerm );
     XLATE_PTR( BTCpuThreadTerm );
+    XLATE_PTR( BTCpuSuspendLocalThread );
+    XLATE_PTR( BTCpuResumeLocalThread );
     XLATE_PTR( __wine_get_unix_opcode );
 #undef XLATE_PTR
     init_syscall_table_pool_copy( 0, "ntdll.dll" );

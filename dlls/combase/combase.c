@@ -1751,6 +1751,40 @@ HRESULT WINAPI CoCreateInstanceFromApp(REFCLSID rclsid, IUnknown *outer, DWORD c
             count, results);
 }
 
+/* Some game audio plugins create MMDeviceEnumerator on an uninitialized asset
+ * worker, then dereference the failed result. Madeira opts into a narrow
+ * compatibility policy: retain an implicit MTA using the existing TLS cookie,
+ * without assigning the worker an explicit apartment or changing its init count.
+ * Thread detach / leave_apartment already release this cookie. Other classes
+ * and explicitly initialized STA/MTA callers keep Wine's normal behavior. */
+static struct apartment *madeira_audio_get_apartment(REFCLSID clsid, DWORD context)
+{
+    static const CLSID mmdevice = {0xbcde0395, 0xe52f, 0x467c,
+            {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}};
+    struct apartment *apt = apartment_get_current_or_mta();
+    struct tlsdata *data;
+    WCHAR policy[2];
+    HRESULT hr;
+
+    if (apt || !(context & CLSCTX_INPROC_SERVER) || !IsEqualCLSID(clsid, &mmdevice))
+        return apt;
+    if (GetEnvironmentVariableW(L"MADEIRA_MMDEVICE_IMPLICIT_MTA", policy, ARRAY_SIZE(policy)) != 1
+            || policy[0] != L'1')
+        return NULL;
+    if (FAILED(hr = com_get_tlsdata(&data)))
+        return NULL;
+    if (!data->implicit_mta_cookie)
+    {
+        if (FAILED(hr = apartment_increment_mta_usage(&data->implicit_mta_cookie)))
+        {
+            ERR("[madeira-audio-com] implicit MTA allocation failed: %#lx\n", hr);
+            return NULL;
+        }
+        ERR("[madeira-audio-com] MMDeviceEnumerator implicit MTA retained until worker teardown\n");
+    }
+    return apartment_get_current_or_mta();
+}
+
 static HRESULT com_get_class_object(REFCLSID rclsid, DWORD clscontext,
         COSERVERINFO *server_info, REFIID riid, void **obj)
 {
@@ -1764,7 +1798,7 @@ static HRESULT com_get_class_object(REFCLSID rclsid, DWORD clscontext,
 
     *obj = NULL;
 
-    if (!(apt = apartment_get_current_or_mta()))
+    if (!(apt = madeira_audio_get_apartment(rclsid, clscontext)))
     {
         ERR("apartment not initialised\n");
         return CO_E_NOTINITIALIZED;

@@ -1773,6 +1773,20 @@ static BOOL alloc_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
     if (thread) NtClose( thread );
 
     *(DWORD *)dir->AddressOfIndex = i;
+#ifdef __arm64ec__
+    {
+        /* iOS-Madeira: native code runs from the module's JIT-pool copy and reads
+         * _tls_index PC-relative there. That copy was taken at map time, before
+         * this slot existed, so it still held 0 and every thread_local access of a
+         * module loaded after process start went to slot 0's block (Deadlock:
+         * DXMT d3d9's GetAdapterIdentifier read xtajit64's 32-byte block +0x60,
+         * heap bytes 0x0101..., and crashed). Store the index in the copy too, as
+         * the delay-load resolver does for its IAT slot. */
+        extern void *xlate_ios_jit( void *ptr );
+        void *pidx = xlate_ios_jit( (void *)dir->AddressOfIndex );
+        if (pidx && pidx != (void *)dir->AddressOfIndex) *(volatile DWORD *)pidx = i;
+    }
+#endif
     tls_dirs[i] = *dir;
     {
         /* iOS-Madeira ml704 [tls-life]: which TLS slot each module actually got.

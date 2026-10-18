@@ -257,6 +257,7 @@ struct d2d_dc_render_target
     LONG refcount;
 
     IDXGISurface1 *dxgi_surface;
+    ID3D11Resource *texture; /* Madeira: read back when there is no dxgi_surface */
     ID3D10Device1 *d3d_device;
     ID2D1RenderTarget *dxgi_target;
     IUnknown *dxgi_inner;

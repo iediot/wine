@@ -26,6 +26,60 @@ static inline struct d2d_dc_render_target *impl_from_IUnknown(IUnknown *iface)
     return CONTAINING_RECORD(iface, struct d2d_dc_render_target, ID2D1DCRenderTarget_iface);
 }
 
+/* Madeira: a D3D11 implementation without IDXGISurface1 (DXMT) has no GetDC. Copy the
+ * target into a staging texture and draw its pixels into the DC instead; before this the
+ * NULL surface was called through (the Rockstar Games Launcher crashed in present). */
+static HRESULT d2d_dc_render_target_present_readback(struct d2d_dc_render_target *render_target)
+{
+    const RECT *dst_rect = &render_target->dst_rect;
+    ID3D11Texture2D *texture, *staging = NULL;
+    D3D11_MAPPED_SUBRESOURCE map;
+    ID3D11DeviceContext *context;
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Device *device;
+    BITMAPINFO bmi;
+    HRESULT hr;
+
+    if (!render_target->texture
+            || FAILED(ID3D11Resource_QueryInterface(render_target->texture, &IID_ID3D11Texture2D, (void **)&texture)))
+        return S_OK;
+    ID3D11Texture2D_GetDesc(texture, &desc);
+    ID3D11Texture2D_GetDevice(texture, &device);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    if (SUCCEEDED(hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &staging)))
+    {
+        ID3D11Device_GetImmediateContext(device, &context);
+        ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)staging, (ID3D11Resource *)texture);
+        if (SUCCEEDED(hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map)))
+        {
+            memset(&bmi, 0, sizeof(bmi));
+            bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+            bmi.bmiHeader.biWidth = map.RowPitch / 4;
+            bmi.bmiHeader.biHeight = -(LONG)desc.Height;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            SetDIBitsToDevice(render_target->hdc, dst_rect->left, dst_rect->top,
+                    min(dst_rect->right - dst_rect->left, (LONG)desc.Width),
+                    min(dst_rect->bottom - dst_rect->top, (LONG)desc.Height),
+                    0, 0, 0, desc.Height, map.pData, &bmi, DIB_RGB_COLORS);
+            ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)staging, 0);
+        }
+        ID3D11DeviceContext_Release(context);
+        ID3D11Texture2D_Release(staging);
+    }
+    if (FAILED(hr))
+        WARN("Readback present failed, %#lx.\n", hr);
+    ID3D11Device_Release(device);
+    ID3D11Texture2D_Release(texture);
+    return S_OK;
+}
+
 static HRESULT d2d_dc_render_target_present(IUnknown *outer_unknown)
 {
     struct d2d_dc_render_target *render_target = impl_from_IUnknown(outer_unknown);
@@ -36,6 +90,9 @@ static HRESULT d2d_dc_render_target_present(IUnknown *outer_unknown)
 
     if (!render_target->hdc)
         return D2DERR_WRONG_STATE;
+
+    if (!render_target->dxgi_surface)
+        return d2d_dc_render_target_present_readback(render_target);
 
     if (FAILED(hr = IDXGISurface1_GetDC(render_target->dxgi_surface, FALSE, &src_hdc)))
     {
@@ -98,6 +155,8 @@ static ULONG STDMETHODCALLTYPE d2d_dc_render_target_Release(ID2D1DCRenderTarget 
         IUnknown_Release(render_target->dxgi_inner);
         if (render_target->dxgi_surface)
             IDXGISurface1_Release(render_target->dxgi_surface);
+        if (render_target->texture)
+            ID3D11Resource_Release(render_target->texture);
         ID3D10Device1_Release(render_target->d3d_device);
         free(render_target);
     }
@@ -751,7 +810,12 @@ static HRESULT STDMETHODCALLTYPE d2d_dc_render_target_BindDC(ID2D1DCRenderTarget
     }
 
     bitmap_impl = unsafe_impl_from_ID2D1Bitmap(bitmap);
-    ID3D11Resource_QueryInterface(bitmap_impl->resource, &IID_IDXGISurface1, (void **)&dxgi_surface);
+    if (FAILED(ID3D11Resource_QueryInterface(bitmap_impl->resource, &IID_IDXGISurface1, (void **)&dxgi_surface)))
+        dxgi_surface = NULL;
+    if (render_target->texture)
+        ID3D11Resource_Release(render_target->texture);
+    render_target->texture = bitmap_impl->resource;
+    ID3D11Resource_AddRef(render_target->texture);
 
     ID2D1DeviceContext_SetTarget(context, (ID2D1Image *)bitmap);
     ID2D1Bitmap_Release(bitmap);

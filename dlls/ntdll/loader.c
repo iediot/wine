@@ -3995,6 +3995,12 @@ static BOOL madeira_force_builtin_dll( const WCHAR *name )
     {
         L"xinput1_1.dll", L"xinput1_2.dll", L"xinput1_3.dll", L"xinput1_4.dll",
         L"xinput9_1_0.dll", L"xinputuap.dll",
+        /* Programs that ship Microsoft's x64 ucrtbase.dll beside them (the Rockstar Games
+         * Launcher and RockstarService.exe) got it next to the builtin in an ARM64EC process;
+         * the same name made the loader treat the x64 copy as EC code, and ntdll called into
+         * it natively (illegal instruction at ucrtbase.dll+0x8980). api-ms-win-crt-* resolve
+         * to ucrtbase.dll, so they follow. */
+        L"ucrtbase.dll",
     };
     static int native = -1;
     unsigned int i;

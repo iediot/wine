@@ -2647,6 +2647,35 @@ static void get_performance_info( SYSTEM_PERFORMANCE_INFORMATION *info )
     info->AvailablePages      = freeram / page_size;
     info->TotalCommittedPages = (totalram + totalswap - freeram - freeswap) / page_size;
     info->TotalCommitLimit    = (totalram + totalswap) / page_size;
+#ifdef WINE_IOS
+    /* Madeira: MADEIRA_COMMIT_LIMIT_MB=N reports a commit limit (MEMORYSTATUSEX.ullTotalPageFile)
+     * of N MB. iPadOS counts its own swap file, so an M5 iPad reported ~32 GB and RDR2.exe,
+     * which reserves 7/8 of it at start, asked for 28672 MB that no hole can hold (an iPhone,
+     * with no OS swap, reports ~7.6 GB and RDR2 takes its 8960 MB minimum). */
+    {
+        static ULONGLONG limit = ~0ull;
+        if (limit == ~0ull)
+        {
+            const char *e = getenv( "MADEIRA_COMMIT_LIMIT_MB" );
+            limit = (e && atoll( e ) > 0) ? (ULONGLONG)atoll( e ) << 20 : 0;
+            if (limit)
+                fprintf( stderr, "[commit-limit] reporting %llu MB instead of %llu MB (RAM %llu + swap %llu)\n",
+                         limit >> 20, (totalram + totalswap) >> 20, totalram >> 20, totalswap >> 20 );
+        }
+        if (limit)
+        {
+            /* Keep what is AVAILABLE (limit - committed) the same, capped by the new limit:
+             * committed is the whole device's, already above 10 GB on an iPad, so capping it at
+             * the limit reported 0 bytes of page file free and Chromium (Social Club) behaved as
+             * if memory were exhausted. */
+            ULONGLONG avail = info->TotalCommitLimit > info->TotalCommittedPages
+                              ? info->TotalCommitLimit - info->TotalCommittedPages : 0;
+            info->TotalCommitLimit = limit / page_size;
+            if (avail > info->TotalCommitLimit) avail = info->TotalCommitLimit;
+            info->TotalCommittedPages = info->TotalCommitLimit - avail;
+        }
+    }
+#endif
 }
 
 #ifdef linux

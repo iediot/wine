@@ -203,7 +203,18 @@ static struct device *add_device( HKEY key, DWORD type )
 
     TRACE( "Adding device %#x / %s.\n", handle, debugstr_w(path) );
     wcscpy( device->path, path );
+#ifdef WINE_IOS
+    /* Madeira: every Wine process shares this one win32u and so this one device list, and
+     * a handle is only meaningful in the process that opened it. Keeping it here let the
+     * next refresh close it in whichever process asked (RDR2's RegisterRawInputDevices
+     * closed the handle number one of the launcher's HID files had, an open audio archive
+     * in RDR2: its streamer then read a reused handle, "Unknown error FFFFFFFF"). The file
+     * is only needed for the queries above, so close it here, in its own process. */
+    NtClose( file );
+    device->file = 0;
+#else
     device->file = file;
+#endif
     device->handle = ULongToHandle(handle);
     device->info = info;
     device->data = preparsed;
@@ -295,7 +306,7 @@ static void rawinput_update_device_list( BOOL force )
     LIST_FOR_EACH_ENTRY_SAFE( device, next, &devices, struct device, entry )
     {
         list_remove( &device->entry );
-        NtClose( device->file );
+        if (device->file) NtClose( device->file );
         free( device->data );
         free( device );
     }
@@ -580,7 +591,7 @@ BOOL process_rawinput_message( MSG *msg, UINT hw_id, const struct hardware_msg_d
             if (msg->wParam == GIDC_REMOVAL)
             {
                 list_remove( &device->entry );
-                NtClose( device->file );
+                if (device->file) NtClose( device->file );
                 free( device->data );
                 free( device );
             }

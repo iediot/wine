@@ -42,7 +42,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
-static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
 
 
 static void get_create_object_attributes( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *nameW,
@@ -78,21 +77,26 @@ static BOOL get_open_object_attributes( OBJECT_ATTRIBUTES *attr, UNICODE_STRING 
     return TRUE;
 }
 
+/* iOS-Madeira: KUSER_SHARED_DATA cannot be mapped at 0x7ffe0000 on iOS, so every read of
+ * user_shared_data traps and is serviced by the Mach exception thread (kernelbase's copy
+ * was fixed in ml1232). RDR2 calls these in a loop: 13.5 million trapped reads in a
+ * 20-minute session, most of its render thread's time. The tick count comes from the same
+ * monotonic clock NtQueryPerformanceCounter reads, so take it from one system call. */
+static ULONGLONG madeira_tick_count(void)
+{
+    LARGE_INTEGER counter, freq;
+
+    NtQueryPerformanceCounter( &counter, &freq );
+    if (!freq.QuadPart) return 0;
+    return counter.QuadPart / freq.QuadPart * 1000 + counter.QuadPart % freq.QuadPart * 1000 / freq.QuadPart;
+}
+
 /******************************************************************************
  *           GetTickCount64       (KERNEL32.@)
  */
 ULONGLONG WINAPI DECLSPEC_HOTPATCH GetTickCount64(void)
 {
-    ULONG high, low;
-
-    do
-    {
-        high = user_shared_data->TickCount.High1Time;
-        low = user_shared_data->TickCount.LowPart;
-    }
-    while (high != user_shared_data->TickCount.High2Time);
-    /* note: we ignore TickCountMultiplier */
-    return (ULONGLONG)high << 32 | low;
+    return madeira_tick_count();
 }
 
 /***********************************************************************
@@ -100,8 +104,7 @@ ULONGLONG WINAPI DECLSPEC_HOTPATCH GetTickCount64(void)
  */
 DWORD WINAPI DECLSPEC_HOTPATCH GetTickCount(void)
 {
-    /* note: we ignore TickCountMultiplier */
-    return user_shared_data->TickCount.LowPart;
+    return (DWORD)madeira_tick_count();
 }
 
 /***********************************************************************

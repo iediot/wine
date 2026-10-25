@@ -305,6 +305,29 @@ static void apply_thread_priority( struct thread *thread )
     mach_port_t thread_port, process_port = thread->process->trace_data;
     int effective_priority = get_effective_thread_priority( thread );
 
+#ifdef WINE_IOS
+    /* madeira-bcd: thread priority keeps the pthread QoS (tools/patch-wine-thread-qos.py).
+     * Below the realtime band the Mach precedence/throughput/latency policies only
+     * demote a USER_INTERACTIVE guest thread onto the efficiency cores. */
+    if (effective_priority < LOW_REALTIME_PRIORITY)
+    {
+        static int keep = -1, logged;
+        if (keep < 0)
+        {
+            const char *e = getenv( "MADEIRA_WIN_THREAD_PRIORITY" );
+            keep = !(e && e[0] == '1');
+        }
+        if (logged < 24)
+        {
+            logged++;
+            fprintf( stderr, "[thread-prio] madeira-bcd tid=%04x base=%d effective=%d -> %s\n",
+                     thread->id, thread->base_priority, effective_priority,
+                     keep ? "kept at pthread QoS" : "Mach policies (MADEIRA_WIN_THREAD_PRIORITY=1)" );
+        }
+        if (keep) return;
+    }
+#endif
+
     if (!process_port) return;
     kr = mach_port_extract_right( process_port, thread->unix_tid,
                                   MACH_MSG_TYPE_COPY_SEND, &thread_port, &type );
@@ -1281,6 +1304,25 @@ int ios_thread_wait_links( struct thread *t, struct object *obj )
     return 0;
 }
 
+/* Madeira wait probe: the server's own view of a thread's current wait, for
+ * queue_ios.c. Returns the object count (objs gets at most max), -1 when the
+ * thread is not waiting. remaining is in 100ns units, -1 for no timeout. */
+int ios_thread_wait_brief( struct thread *t, int *select, int *flags, long long *remaining,
+                           unsigned long long *key, struct object **objs, int max )
+{
+    struct thread_wait *w;
+    int i;
+    if (!t || !(w = t->wait)) return -1;
+    *select = w->select;
+    *flags  = w->flags;
+    *key    = w->key;
+    if (w->when == TIMEOUT_INFINITE) *remaining = -1;
+    else if (w->when >= 0) *remaining = w->when > current_time ? w->when - current_time : 0;
+    else *remaining = -w->when > monotonic_time ? -w->when - monotonic_time : 0;
+    for (i = 0; i < w->count && i < max; i++) objs[i] = w->queues[i].obj;
+    return w->count;
+}
+
 int add_queue( struct object *obj, struct wait_queue_entry *entry )
 {
     list_add_tail( &obj->wait_queue, &entry->entry );
@@ -1538,6 +1580,15 @@ static int send_thread_wakeup( struct thread *thread, client_ptr_t cookie, int s
     memset( &reply, 0, sizeof(reply) );
     reply.cookie   = cookie;
     reply.signaled = signaled;
+#ifdef WINE_IOS
+    {
+        /* Madeira wait probe (build/wineserver/queue_ios.c): note who ends this
+         * wait before the client can read the reply. 0 = the server itself. */
+        extern void ios_wait_wakeup_hook( unsigned int tid, client_ptr_t cookie, int signaled,
+                                          unsigned int waker );
+        ios_wait_wakeup_hook( thread->id, cookie, signaled, current ? current->id : 0 );
+    }
+#endif
     if ((ret = write( get_unix_fd( thread->wait_fd ), &reply, sizeof(reply) )) == sizeof(reply))
         return 0;
     if (ret >= 0)

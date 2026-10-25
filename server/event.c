@@ -764,6 +764,21 @@ int ios_obj_is_event( struct object *obj )
     return obj && obj->ops == &event_ops;
 }
 
+/* Madeira wait probe (queue_ios.c): the lifetime counters of one event, so a
+ * stall snapshot can name the thread that normally sets what a waiter waits on. */
+int ios_evt_brief( struct object *obj, unsigned int *n_set, unsigned int *last_set_tid,
+                   unsigned int *n_reset, unsigned int *last_reset_tid )
+{
+    struct event *event;
+    if (!ios_obj_is_event( obj )) return 0;
+    event = (struct event *)obj;
+    *n_set          = event->ios.n_set;
+    *last_set_tid   = event->ios.last_set_tid;
+    *n_reset        = event->ios.n_reset;
+    *last_reset_tid = event->ios.last_reset_tid;
+    return 1;
+}
+
 /* ml805: the sync object a waiter would actually queue on. */
 void *ios_evt_sync_of( struct object *obj )
 {

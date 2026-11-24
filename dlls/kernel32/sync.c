@@ -77,35 +77,12 @@ static BOOL get_open_object_attributes( OBJECT_ATTRIBUTES *attr, UNICODE_STRING 
     return TRUE;
 }
 
-/* iOS-Madeira: KUSER_SHARED_DATA cannot be mapped at 0x7ffe0000 on iOS, so every read of
- * user_shared_data traps and is serviced by the Mach exception thread (kernelbase's copy
- * was fixed in ml1232). RDR2 calls these in a loop: 13.5 million trapped reads in a
- * 20-minute session, most of its render thread's time. The tick count comes from the same
- * monotonic clock NtQueryPerformanceCounter reads, so take it from one system call. */
-static ULONGLONG madeira_tick_count(void)
-{
-    LARGE_INTEGER counter, freq;
-
-    NtQueryPerformanceCounter( &counter, &freq );
-    if (!freq.QuadPart) return 0;
-    return counter.QuadPart / freq.QuadPart * 1000 + counter.QuadPart % freq.QuadPart * 1000 / freq.QuadPart;
-}
-
-/******************************************************************************
- *           GetTickCount64       (KERNEL32.@)
- */
-ULONGLONG WINAPI DECLSPEC_HOTPATCH GetTickCount64(void)
-{
-    return madeira_tick_count();
-}
-
-/***********************************************************************
- *           GetTickCount       (KERNEL32.@)
- */
-DWORD WINAPI DECLSPEC_HOTPATCH GetTickCount(void)
-{
-    return (DWORD)madeira_tick_count();
-}
+/* iOS-Madeira ml1381: GetTickCount and GetTickCount64 are forwarded to kernelbase
+ * (kernel32.spec -import). kernel32's own copies read KUSER_SHARED_DATA at
+ * 0x7ffe0000, which iOS cannot map, so every call trapped and was serviced by the
+ * sub-floor fault path (thousands of Mach exceptions a second in a game that polls
+ * the tick count); kernelbase's ml1232 versions read the same clock with one system
+ * call and no fault. */
 
 /***********************************************************************
  *           RegisterWaitForSingleObject   (KERNEL32.@)

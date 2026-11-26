@@ -1347,6 +1347,22 @@ static struct futex_queue *get_futex_queue( const void *addr )
     return &ios_get_futex_table()[(val >> 4) % ARRAY_SIZE(futex_queues)];
 }
 
+/* No waiter can be on this bucket: skip the spinlock. Wine's SRW release wakes on
+ * nearly every unlock, so RDR2 made ~490k wake calls a second with ~270 waits, each
+ * one a locked CAS on a bucket shared by every thread. A waiter takes the lock,
+ * compares the value and queues itself in one critical section; the waker changed
+ * the value before calling. After a full fence, a free lock and an empty list mean
+ * any later waiter's compare sees the new value, and an earlier one is in the list. */
+static inline BOOL futex_queue_idle( struct futex_queue *queue )
+{
+    struct list *next;
+
+    __atomic_thread_fence( __ATOMIC_SEQ_CST );
+    if (__atomic_load_n( &queue->lock, __ATOMIC_ACQUIRE )) return FALSE;
+    next = __atomic_load_n( &queue->queue.next, __ATOMIC_ACQUIRE );
+    return !next || next == &queue->queue;
+}
+
 static void spin_lock( LONG *lock )
 {
     while (InterlockedCompareExchange( lock, -1, 0 ))
@@ -1468,6 +1484,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     TRACE("%p\n", addr);
 
     if (!addr) return;
+    if (futex_queue_idle( queue )) return;
 
     spin_lock( &queue->lock );
 
@@ -1511,6 +1528,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
     TRACE("%p\n", addr);
 
     if (!addr) return;
+    if (futex_queue_idle( queue )) return;
 
     spin_lock( &queue->lock );
 

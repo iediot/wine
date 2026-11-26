@@ -2486,7 +2486,14 @@ NTSTATUS WINAPI LdrUnregisterDllNotification( void *cookie )
  */
 NTSTATUS WINAPI LdrLockLoaderLock( ULONG flags, ULONG *result, ULONG_PTR *magic )
 {
-    if (flags & ~0x2) FIXME( "flags %lx not supported\n", flags );
+    /* madeira: flag 0x1 (raise on errors) only matters on the error paths below,
+     * which return their status instead. Red Dead Redemption 2's main thread passes
+     * it ~50,000 times in four seconds while it starts (log 2026-11-27 00:19), and a
+     * FIXME line for each one was a log write on that thread; say it once. */
+    static LONG flag1_noted;
+    if (flags & ~0x3) FIXME( "flags %lx not supported\n", flags );
+    else if ((flags & 0x1) && !InterlockedExchange( &flag1_noted, 1 ))
+        FIXME( "flags %lx: 0x1 (raise on errors) not supported, errors are returned; noted once\n", flags );
 
     if (result) *result = 0;
     if (magic) *magic = 0;

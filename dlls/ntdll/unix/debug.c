@@ -292,6 +292,57 @@ const char * __cdecl __wine_dbg_strdup( const char *str )
     return memcpy( info->strings + pos, str, n );
 }
 
+#ifdef WINE_IOS
+/* madeira-bcd log-volume (2026-11-27): FEX (xtajit64.dll, Common/Logging.cpp) sends every
+ * LogMan line through the PE ntdll's __wine_dbg_output, which ends here as one write of
+ * "<level> <hex tid> <message>\n". Four of its per-event messages were 3/4 of the RDR2 log
+ * (log 1127-0105-wave1: 40,732 "Unhandled JIT SIGBUS", 19,353 "Handled inline self-modifying
+ * code", 4,882 "Add SMC interval", 642 "Failed to mprotect"; ~100 a second in play). Each
+ * keeps its first lines verbatim, then one in `every` with a "[fex-log]" count line; every
+ * other line passes unchanged and FEX's code is not touched.
+ * env.MADEIRA_FEX_LOG_ALL = 1 writes every line, exactly as before. */
+static int madeira_fex_log_drop( const char *str, unsigned int len )
+{
+    static const struct { const char *text; unsigned int len, keep, every; const char *label; } kinds[] =
+    {
+        { "Handled inline self-modifying code: ", 36, 32, 2048, "Handled inline self-modifying code" },
+        { "Unhandled JIT SIGBUS: PC: ", 26, 64, 1024, "Unhandled JIT SIGBUS" },
+        { "Add SMC interval: ", 18, 32, 1024, "Add SMC interval" },
+        { "Failed to mprotect last page of code buffer", 43, 16, 256, "Failed to mprotect last page of code buffer" },
+    };
+    static int all = -1;
+    static int counts[ARRAY_SIZE(kinds)];
+    unsigned int i, pos;
+    int n;
+
+    if (len < 4 || str[1] != ' ' || (str[0] != 'D' && str[0] != 'E' && str[0] != 'I' && str[0] != 'W')) return 0;
+    for (pos = 2; pos < len && ((str[pos] >= '0' && str[pos] <= '9') || (str[pos] >= 'A' && str[pos] <= 'F')); pos++) ;
+    if (pos == 2 || pos >= len || str[pos] != ' ') return 0;
+    pos++;
+    for (i = 0; i < ARRAY_SIZE(kinds); i++)
+    {
+        if (len - pos < kinds[i].len || memcmp( str + pos, kinds[i].text, kinds[i].len )) continue;
+        if (all < 0)
+        {
+            const char *e = getenv( "MADEIRA_FEX_LOG_ALL" );   /* 1 = every FEX per-event line, as before the sampling */
+            all = e && e[0] == '1';
+        }
+        if (all) return 0;
+        n = __atomic_add_fetch( &counts[i], 1, __ATOMIC_RELAXED );
+        if ((unsigned int)n <= kinds[i].keep) return 0;
+        if (n % kinds[i].every) return 1;
+        {
+            char line[200];
+            int l = snprintf( line, sizeof(line), "[fex-log] %d \"%s\" lines so far; after the first %u, one in %u "
+                              "is kept (this is the next)\n", n, kinds[i].label, kinds[i].keep, kinds[i].every );
+            if (l > 0) write( 2, line, l < (int)sizeof(line) ? l : (int)sizeof(line) - 1 );
+        }
+        return 0;
+    }
+    return 0;
+}
+#endif
+
 /***********************************************************************
  *		unixcall_wine_dbg_write
  */
@@ -299,6 +350,9 @@ NTSTATUS unixcall_wine_dbg_write( void *args )
 {
     struct wine_dbg_write_params *params = args;
 
+#ifdef WINE_IOS
+    if (madeira_fex_log_drop( params->str, params->len )) return params->len;   /* madeira-bcd log-volume */
+#endif
     return write( 2, params->str, params->len );
 }
 

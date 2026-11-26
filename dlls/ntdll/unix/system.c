@@ -2644,7 +2644,7 @@ static void get_performance_info( SYSTEM_PERFORMANCE_INFORMATION *info )
     /* Titan Quest refuses to run if TotalPageFile <= TotalPhys */
     if (!totalswap) totalswap = page_size;
 
-#ifdef __APPLE__
+#ifdef WINE_IOS   /* virtual_ios.c is in the iOS build only; the host ntdll.so has no ios_avail_phys */
     {
         /* madeira-bcd: avail-phys (tools/patch-wine-avail-phys.py): with madeira.cfg
          * avail-phys = 1, what remains before this app's memory limit when that

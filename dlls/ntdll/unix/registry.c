@@ -38,6 +38,89 @@ WINE_DEFAULT_DEBUG_CHANNEL(reg);
 /* maximum length of a value name in bytes (without terminating null) */
 #define MAX_VALUE_LENGTH (16383 * sizeof(WCHAR))
 
+#ifdef WINE_IOS
+/* madeira: build/ntdll-unix/regcache_ios.c, the client-side registry read cache
+ * (env.MADEIRA_REG_CACHE) and census (env.MADEIRA_REG_CENSUS). A handle the
+ * cache answered an open with is known only to it; every function below that
+ * passes a key handle to the server first turns it into a real handle
+ * (IOS_RC_REAL), and every write brackets its request with
+ * ios_regcache_write_begin / _end, which keeps the cache exactly as fresh as
+ * the server for every process. */
+extern int ios_regcache_on;
+extern int ios_regcache_init( void );
+extern void ios_regcache_write_begin( void );
+extern void ios_regcache_write_end( int changed );
+extern int ios_regcache_open( HANDLE *key, HANDLE root, const UNICODE_STRING *name, ACCESS_MASK access,
+                              ULONG attributes, ULONG options, NTSTATUS *status );
+extern int ios_regcache_query( HANDLE *handle, const UNICODE_STRING *name, ULONG *type, ULONG *total,
+                               void *data, ULONG max, NTSTATUS *status );
+extern void ios_regcache_query_done( HANDLE handle, const UNICODE_STRING *name, NTSTATUS status );
+extern NTSTATUS ios_regcache_real( HANDLE *handle, const char *op );
+extern void ios_regcache_note_create( HANDLE root, const UNICODE_STRING *name, NTSTATUS status, HANDLE key );
+
+static inline int ios_rc_on( void )
+{
+    int on = __atomic_load_n( &ios_regcache_on, __ATOMIC_ACQUIRE );
+    return on < 0 ? ios_regcache_init() : on;
+}
+
+#define IOS_RC_REAL( handle, op ) \
+    do { NTSTATUS rc_status_; \
+         if (ios_rc_on() && (rc_status_ = ios_regcache_real( &(handle), op ))) return rc_status_; } while (0)
+
+/* an OBJECT_ATTRIBUTES whose RootDirectory is a cached handle: a copy with the real one */
+#define IOS_RC_REAL_ROOT( attr, copy, op ) \
+    do { HANDLE rc_root_ = (attr) ? (attr)->RootDirectory : 0; NTSTATUS rc_status_; \
+         if (rc_root_ && ios_rc_on()) \
+         { \
+             if ((rc_status_ = ios_regcache_real( &rc_root_, op ))) return rc_status_; \
+             if (rc_root_ != (attr)->RootDirectory) { (copy) = *(attr); (copy).RootDirectory = rc_root_; (attr) = &(copy); } \
+         } } while (0)
+
+/* the requests themselves, for regcache_ios.c */
+NTSTATUS ios_reg_srv_open( HANDLE *key, HANDLE root, const WCHAR *name, USHORT len,
+                           ACCESS_MASK access, ULONG attributes )
+{
+    unsigned int ret;
+
+    *key = 0;
+    SERVER_START_REQ( open_key )
+    {
+        req->parent     = wine_server_obj_handle( root );
+        req->access     = access;
+        req->attributes = attributes;
+        wine_server_add_data( req, name, len );
+        ret = wine_server_call( req );
+        *key = wine_server_ptr_handle( reply->hkey );
+    }
+    SERVER_END_REQ;
+    return ret;
+}
+
+NTSTATUS ios_reg_srv_query( HANDLE key, const WCHAR *name, USHORT len, ULONG *type, ULONG *total,
+                            void *data, ULONG max )
+{
+    unsigned int ret;
+
+    SERVER_START_REQ( get_key_value )
+    {
+        req->hkey = wine_server_obj_handle( key );
+        wine_server_add_data( req, name, len );
+        if (max) wine_server_set_reply( req, data, max );
+        if (!(ret = wine_server_call( req )))
+        {
+            *type = reply->type;
+            *total = reply->total;
+        }
+    }
+    SERVER_END_REQ;
+    return ret;
+}
+#else
+#define IOS_RC_REAL( handle, op ) do { } while (0)
+#define IOS_RC_REAL_ROOT( attr, copy, op ) do { } while (0)
+#endif
+
 
 NTSTATUS open_hkcu_key( const char *path, HANDLE *key )
 {
@@ -77,16 +160,24 @@ NTSTATUS WINAPI NtCreateKey( HANDLE *key, ACCESS_MASK access, const OBJECT_ATTRI
     unsigned int ret;
     data_size_t len;
     struct object_attributes *objattr;
+#ifdef WINE_IOS
+    OBJECT_ATTRIBUTES rc_attr;
+    HANDLE rc_orig_root = attr->RootDirectory;
+#endif
 
     *key = 0;
     if (attr->Length != sizeof(OBJECT_ATTRIBUTES)) return STATUS_INVALID_PARAMETER;
     if (!attr->ObjectName->Length && !attr->RootDirectory) return STATUS_OBJECT_PATH_SYNTAX_BAD;
+    IOS_RC_REAL_ROOT( attr, rc_attr, "create under" );
     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
     objattr->attributes |= OBJ_OPENIF | OBJ_CASE_INSENSITIVE;
 
     TRACE( "(%p,%s,%s,%x,%x,%p)\n", attr->RootDirectory, debugstr_us(attr->ObjectName),
            debugstr_us(class), options, access, key );
 
+#ifdef WINE_IOS
+    ios_regcache_write_begin();
+#endif
     SERVER_START_REQ( create_key )
     {
         req->access     = access;
@@ -97,6 +188,13 @@ NTSTATUS WINAPI NtCreateKey( HANDLE *key, ACCESS_MASK access, const OBJECT_ATTRI
         *key = wine_server_ptr_handle( reply->hkey );
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    /* STATUS_SUCCESS: a new key; STATUS_OBJECT_NAME_EXISTS: opened, nothing changed */
+    ios_regcache_write_end( ret == STATUS_SUCCESS );
+    if (ios_regcache_on > 0)
+        ios_regcache_note_create( rc_orig_root, attr->ObjectName,
+                                  ret == STATUS_OBJECT_NAME_EXISTS ? STATUS_SUCCESS : ret, *key );
+#endif
 
     if (ret == STATUS_OBJECT_NAME_EXISTS)
     {
@@ -144,6 +242,15 @@ NTSTATUS WINAPI NtOpenKeyEx( HANDLE *key, ACCESS_MASK access, const OBJECT_ATTRI
     if (options & ~REG_OPTION_OPEN_LINK) FIXME( "options %x not implemented\n", options );
 
     attributes = attr->Attributes | OBJ_CASE_INSENSITIVE;
+
+#ifdef WINE_IOS
+    if (ios_rc_on() && ios_regcache_open( key, attr->RootDirectory, attr->ObjectName, access,
+                                          attributes, options, (NTSTATUS *)&ret ))
+    {
+        TRACE("<- %p (%x)\n", *key, ret);
+        return ret;
+    }
+#endif
 
     SERVER_START_REQ( open_key )
     {
@@ -199,12 +306,19 @@ NTSTATUS WINAPI NtDeleteKey( HANDLE key )
 
     TRACE( "(%p)\n", key );
 
+    IOS_RC_REAL( key, "delete key" );
+#ifdef WINE_IOS
+    ios_regcache_write_begin();
+#endif
     SERVER_START_REQ( delete_key )
     {
         req->hkey = wine_server_obj_handle( key );
         ret = wine_server_call( req );
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    ios_regcache_write_end( 1 );
+#endif
     return ret;
 }
 
@@ -221,6 +335,10 @@ NTSTATUS WINAPI NtRenameKey( HANDLE key, UNICODE_STRING *name )
     if (!name) return STATUS_ACCESS_VIOLATION;
     if (!name->Buffer || !name->Length) return STATUS_INVALID_PARAMETER;
 
+    IOS_RC_REAL( key, "rename" );
+#ifdef WINE_IOS
+    ios_regcache_write_begin();
+#endif
     SERVER_START_REQ( rename_key )
     {
         req->hkey = wine_server_obj_handle( key );
@@ -228,6 +346,9 @@ NTSTATUS WINAPI NtRenameKey( HANDLE key, UNICODE_STRING *name )
         ret = wine_server_call( req );
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    ios_regcache_write_end( 1 );
+#endif
     return ret;
 }
 
@@ -359,6 +480,7 @@ NTSTATUS WINAPI NtEnumerateKey( HANDLE handle, ULONG index, KEY_INFORMATION_CLAS
 {
     /* -1 means query key, so avoid it here */
     if (index == (ULONG)-1) return STATUS_NO_MORE_ENTRIES;
+    IOS_RC_REAL( handle, "enum subkeys" );
     return enumerate_key( handle, index, info_class, info, length, result_len );
 }
 
@@ -369,8 +491,26 @@ NTSTATUS WINAPI NtEnumerateKey( HANDLE handle, ULONG index, KEY_INFORMATION_CLAS
 NTSTATUS WINAPI NtQueryKey( HANDLE handle, KEY_INFORMATION_CLASS info_class,
                             void *info, DWORD length, DWORD *result_len )
 {
+    IOS_RC_REAL( handle, "query key" );
     return enumerate_key( handle, -1, info_class, info, length, result_len );
 }
+
+#ifdef WINE_IOS
+/* a key handle's full name, for regcache_ios.c's census */
+NTSTATUS ios_reg_srv_keyname( HANDLE key, WCHAR *name, ULONG size, ULONG *len )
+{
+    char buffer[offsetof( KEY_NAME_INFORMATION, Name ) + 512];
+    KEY_NAME_INFORMATION *info = (KEY_NAME_INFORMATION *)buffer;
+    DWORD result_len;
+    NTSTATUS status = enumerate_key( key, -1, KeyNameInformation, info, sizeof(buffer), &result_len );
+
+    *len = 0;
+    if (status && status != STATUS_BUFFER_OVERFLOW) return status;
+    *len = min( min( info->NameLength, size ), sizeof(buffer) - offsetof( KEY_NAME_INFORMATION, Name ) );
+    memcpy( name, info->Name, *len );
+    return STATUS_SUCCESS;
+}
+#endif
 
 
 /******************************************************************************
@@ -464,6 +604,7 @@ NTSTATUS WINAPI NtEnumerateValueKey( HANDLE handle, ULONG index, KEY_VALUE_INFOR
     }
     fixed_size = (char *)ptr - (char *)info;
 
+    IOS_RC_REAL( handle, "enum values" );
     SERVER_START_REQ( enum_key_value )
     {
         req->hkey       = wine_server_obj_handle( handle );
@@ -538,6 +679,26 @@ NTSTATUS WINAPI NtQueryValueKey( HANDLE handle, const UNICODE_STRING *name,
         return STATUS_INVALID_PARAMETER;
     }
 
+#ifdef WINE_IOS
+    {
+        HANDLE rc_orig = handle;
+        ULONG rc_type = 0, rc_total = 0;
+
+        /* answered from the cache: the same structure the reply below builds */
+        if (ios_rc_on() &&
+            ios_regcache_query( &handle, name, &rc_type, &rc_total, data_ptr,
+                                (length > fixed_size && data_ptr) ? length - fixed_size : 0, (NTSTATUS *)&ret ))
+        {
+            if (!ret)
+            {
+                copy_key_value_info( info_class, info, length, rc_type, name->Length, rc_total );
+                *result_len = fixed_size + (info_class == KeyValueBasicInformation ? 0 : rc_total);
+                if (length < min_size) ret = STATUS_BUFFER_TOO_SMALL;
+                else if (length < *result_len) ret = STATUS_BUFFER_OVERFLOW;
+            }
+            return ret;
+        }
+#endif
     SERVER_START_REQ( get_key_value )
     {
         req->hkey = wine_server_obj_handle( handle );
@@ -553,6 +714,10 @@ NTSTATUS WINAPI NtQueryValueKey( HANDLE handle, const UNICODE_STRING *name,
         }
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+        if (ios_regcache_on > 0) ios_regcache_query_done( rc_orig, name, ret );
+    }
+#endif
     return ret;
 }
 
@@ -580,6 +745,10 @@ NTSTATUS WINAPI NtSetValueKey( HANDLE key, const UNICODE_STRING *name, ULONG ind
 
     if (name->Length > MAX_VALUE_LENGTH) return STATUS_INVALID_PARAMETER;
 
+    IOS_RC_REAL( key, "set value" );
+#ifdef WINE_IOS
+    ios_regcache_write_begin();
+#endif
     SERVER_START_REQ( set_key_value )
     {
         req->hkey    = wine_server_obj_handle( key );
@@ -590,6 +759,9 @@ NTSTATUS WINAPI NtSetValueKey( HANDLE key, const UNICODE_STRING *name, ULONG ind
         ret = wine_server_call( req );
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    ios_regcache_write_end( 1 );
+#endif
     return ret;
 }
 
@@ -605,6 +777,10 @@ NTSTATUS WINAPI NtDeleteValueKey( HANDLE key, const UNICODE_STRING *name )
 
     if (name->Length > MAX_VALUE_LENGTH) return STATUS_OBJECT_NAME_NOT_FOUND;
 
+    IOS_RC_REAL( key, "delete value" );
+#ifdef WINE_IOS
+    ios_regcache_write_begin();
+#endif
     SERVER_START_REQ( delete_key_value )
     {
         req->hkey = wine_server_obj_handle( key );
@@ -612,6 +788,9 @@ NTSTATUS WINAPI NtDeleteValueKey( HANDLE key, const UNICODE_STRING *name )
         ret = wine_server_call( req );
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    ios_regcache_write_end( 1 );
+#endif
     return ret;
 }
 
@@ -632,6 +811,8 @@ NTSTATUS WINAPI NtNotifyChangeMultipleKeys( HANDLE key, ULONG count, OBJECT_ATTR
 
     if (count || attr || apc || apc_context || buffer || length)
         FIXME( "Unimplemented optional parameter\n" );
+
+    IOS_RC_REAL( key, "notify" );
 
     if (!async)
     {
@@ -681,6 +862,7 @@ NTSTATUS WINAPI NtFlushKey( HANDLE key )
 
     TRACE( "key=%p\n", key );
 
+    IOS_RC_REAL( key, "flush" );
     SERVER_START_REQ( flush_key )
     {
 	req->hkey = wine_server_obj_handle( key );
@@ -721,6 +903,9 @@ NTSTATUS WINAPI NtLoadKeyEx( const OBJECT_ATTRIBUTES *attr, OBJECT_ATTRIBUTES *f
     char *unix_name;
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *file;
+#ifdef WINE_IOS
+    OBJECT_ATTRIBUTES rc_attr;
+#endif
 
     TRACE( "(%p,%p,0x%x,%p,%p,0x%x,%p,%p)\n",
            attr, file, flags, trustkey, event, access, roothandle, iostatus );
@@ -742,9 +927,26 @@ NTSTATUS WINAPI NtLoadKeyEx( const OBJECT_ATTRIBUTES *attr, OBJECT_ATTRIBUTES *f
 
     if (ret) return ret;
 
+#ifdef WINE_IOS
+    if (attr->RootDirectory && ios_rc_on())
+    {
+        HANDLE root = attr->RootDirectory;
+        if ((ret = ios_regcache_real( &root, "load under" )))
+        {
+            NtClose( key );
+            return ret;
+        }
+        rc_attr = *attr;
+        rc_attr.RootDirectory = root;
+        attr = &rc_attr;
+    }
+#endif
     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
     objattr->attributes |= OBJ_OPENIF | OBJ_CASE_INSENSITIVE;
 
+#ifdef WINE_IOS
+    ios_regcache_write_begin();
+#endif
     SERVER_START_REQ( load_registry )
     {
         req->file = wine_server_obj_handle( key );
@@ -753,6 +955,9 @@ NTSTATUS WINAPI NtLoadKeyEx( const OBJECT_ATTRIBUTES *attr, OBJECT_ATTRIBUTES *f
         if (ret == STATUS_OBJECT_NAME_EXISTS) ret = STATUS_SUCCESS;
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    ios_regcache_write_end( 1 );
+#endif
 
     NtClose( key );
     free( objattr );
@@ -772,6 +977,23 @@ NTSTATUS WINAPI NtUnloadKey( OBJECT_ATTRIBUTES *attr )
     if (attr->Length != sizeof(*attr)) return STATUS_INVALID_PARAMETER;
     if (attr->ObjectName->Length & 1) return STATUS_OBJECT_NAME_INVALID;
 
+#ifdef WINE_IOS
+    {
+        HANDLE root = attr->RootDirectory;
+        IOS_RC_REAL( root, "unload under" );
+        ios_regcache_write_begin();
+        SERVER_START_REQ( unload_registry )
+        {
+            req->parent     = wine_server_obj_handle( root );
+            req->attributes = attr->Attributes;
+            wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
+            ret = wine_server_call(req);
+        }
+        SERVER_END_REQ;
+        ios_regcache_write_end( 1 );
+        return ret;
+    }
+#endif
     SERVER_START_REQ( unload_registry )
     {
         req->parent     = wine_server_obj_handle( attr->RootDirectory );
@@ -793,6 +1015,7 @@ NTSTATUS WINAPI NtSaveKey( HANDLE key, HANDLE file )
 
     TRACE( "(%p,%p)\n", key, file );
 
+    IOS_RC_REAL( key, "save" );
     SERVER_START_REQ( save_registry )
     {
         req->hkey = wine_server_obj_handle( key );

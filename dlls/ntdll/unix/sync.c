@@ -2269,6 +2269,184 @@ void madeira_set_eco( int on )   /* the app's ECO pill */
 }
 int madeira_get_eco(void) { ios_eco_init(); return ios_eco_on > 0; }
 
+#ifdef WINE_IOS
+/* madeira-bcd yield-esc (2026-11-27): PER-THREAD YIELD COUNTS, AND YIELD-SPIN ESCALATION.
+ *
+ * RDR2 on the iPhone 18 Pro under the energy clamp (log 1127-0105-wave1): ~25 threads
+ * runnable on 6 cores ([xp] run=50 s per 2 s window), 5,000-11,000 yields a second
+ * (3,500-8,200 of them Sleep(0)), and the Sleep(0) rate rises with the clock: given
+ * more CPU the waiting threads simply spin more. Six job workers ran at ~4 instructions
+ * per cycle for ~410 ms per 2 s each, the signature of a wait loop rather than work.
+ * The ml1063 adaptive yield below cannot catch them: its streak resets after a 2 ms gap,
+ * and with 25 runnable threads one sched_yield already takes longer than that.
+ *
+ * Counts: every thread that yields gets a slot in ios_ystat_tab (keyed by its Mach
+ * thread id); the [xp-t] sampler (server_ios.c) prints per-window deltas: y = direct
+ * NtYieldExecution, z = Sleep(0), s = timed sleeps under 5 ms, e = escalated yields.
+ * env.MADEIRA_YIELD_STATS = 0 turns the counting off. With MADEIRA_YIELD_ESCALATE unset or
+ * 0 no yield, sleep or wait behaves differently from before.
+ *
+ * Escalation, opt-in per image (env.MADEIRA_YIELD_ESCALATE = RDR2.exe; "1" = every
+ * process; unset/0 = off): after yield-esc-after (32) consecutive yields with no real
+ * wait in between, a yield (SwitchToThread, Sleep(0), the futex bucket back-off) becomes
+ * a real sleep of yield-esc-us (20) microseconds, doubling per further yield up to
+ * yield-esc-cap-us (100; at most 500). Any real wait (a non-zero or infinite wait, a timed sleep, an
+ * alert wait) resets it, and so does real work: more than yield-esc-work-us (250) of
+ * this thread's own CPU time since its previous yield (a pause loop between two yields
+ * costs microseconds; work between two wait episodes usually more). A spinner re-checks
+ * its condition after every yield, so a condition that is already satisfied is seen at
+ * most one sleep (<= the cap, plus the kernel's timer slack) later; a thread whose wait
+ * episodes are separated by less work than that pays up to the cap once per episode. */
+struct ios_ystat { volatile uint64_t tid; volatile long long yields, zero, shortsleep, esc, esc_us; };
+#define IOS_YSTAT_N 1024
+struct ios_ystat ios_ystat_tab[IOS_YSTAT_N];   /* read by the [xp-t] sampler */
+volatile int ios_ystat_full;
+static __thread struct ios_ystat *ios_ystat_self;
+static __thread int ios_ystat_none;
+static int ios_ystat_on = -1;   /* env.MADEIRA_YIELD_STATS = 0: no slots, no counting */
+volatile long long ios_xp_yield_esc, ios_xp_yield_esc_us;
+
+static struct ios_ystat *ios_ystat_get(void)
+{
+    uint64_t tid = 0;
+    unsigned int h, i;
+
+    if (__builtin_expect( ios_ystat_self != NULL, 1 ) || ios_ystat_none) return ios_ystat_self;
+    if (ios_ystat_on < 0)
+    {
+        const char *e = getenv( "MADEIRA_YIELD_STATS" );   /* per-thread yield counts for [xp-t]; 0 = off */
+        ios_ystat_on = !(e && e[0] == '0');
+    }
+    if (!ios_ystat_on) { ios_ystat_none = 1; return NULL; }
+    pthread_threadid_np( NULL, &tid );
+    h = (unsigned int)((tid * 2654435761u) % IOS_YSTAT_N);
+    for (i = 0; i < IOS_YSTAT_N; i++, h = (h + 1) % IOS_YSTAT_N)
+    {
+        uint64_t cur = ios_ystat_tab[h].tid;
+        if (cur == tid || (!cur && __sync_bool_compare_and_swap( &ios_ystat_tab[h].tid, 0, tid )))
+            return ios_ystat_self = &ios_ystat_tab[h];
+    }
+    ios_ystat_none = 1;
+    ios_ystat_full = 1;
+    return NULL;
+}
+
+struct ios_yesc_cfg { unsigned int after, start_us, cap_us; unsigned long long work_ns; };
+struct ios_yesc_state { unsigned int streak, sleep_us; unsigned long long last_cpu_ns; };
+
+/* The microseconds this yield sleeps; 0 = an ordinary yield. cpu_ns: the thread's own
+ * CPU time now. Pure, so tests/host/check-yield-escalate.py runs it. */
+static unsigned int ios_yesc_step( struct ios_yesc_state *s, const struct ios_yesc_cfg *c,
+                                   unsigned long long cpu_ns )
+{
+    if (s->last_cpu_ns && (cpu_ns < s->last_cpu_ns || cpu_ns - s->last_cpu_ns > c->work_ns))
+    {
+        s->streak = 0;   /* it worked since its last yield: not a spin */
+        s->sleep_us = 0;
+    }
+    s->last_cpu_ns = cpu_ns;
+    if (++s->streak <= c->after) return 0;
+    if (!s->sleep_us) s->sleep_us = c->start_us;
+    else s->sleep_us = s->sleep_us >= c->cap_us / 2 ? c->cap_us : s->sleep_us * 2;
+    if (s->sleep_us > c->cap_us) s->sleep_us = c->cap_us;
+    return s->sleep_us;
+}
+
+static void ios_yesc_reset( struct ios_yesc_state *s )
+{
+    s->streak = 0;
+    s->sleep_us = 0;
+    s->last_cpu_ns = 0;
+}
+
+/* Does the image name (the path's last component) appear in a ';' or ',' separated list? */
+static int ios_yesc_image_listed( const WCHAR *path, int len, const char *list )
+{
+    int start = len, n;
+    const char *p = list;
+
+    while (start > 0 && path[start - 1] != '\\' && path[start - 1] != '/') start--;
+    n = len - start;
+    while (*p)
+    {
+        const char *e = p;
+        int i;
+        while (*e && *e != ';' && *e != ',') e++;
+        while (p < e && *p == ' ') p++;
+        if (e - p == n)
+        {
+            for (i = 0; i < n; i++)
+            {
+                WCHAR a = path[start + i];
+                char b = p[i];
+                if (a >= 'A' && a <= 'Z') a += 32;
+                if (b >= 'A' && b <= 'Z') b += 32;
+                if (a != (WCHAR)(unsigned char)b) break;
+            }
+            if (i == n) return 1;
+        }
+        p = *e ? e + 1 : e;
+    }
+    return 0;
+}
+
+static int ios_yesc_mode = -1;   /* 0 off, 1 every process, 2 listed images */
+static char ios_yesc_list[256];
+static struct ios_yesc_cfg ios_yesc_conf;
+static pthread_once_t ios_yesc_once = PTHREAD_ONCE_INIT;
+static __thread signed char ios_yesc_on = -1;   /* this thread: -1 = not decided yet */
+static __thread struct ios_yesc_state ios_yesc;
+static __thread int ios_yesc_in_timed_delay;     /* NtDelayExecution's own yield: 1 = timed sleep, 2 = Sleep(0) */
+
+static void ios_yesc_init(void)
+{
+    const char *e = getenv( "MADEIRA_YIELD_ESCALATE" );   /* yield-spin escalation: image names (RDR2.exe; ; or , between), 1 = every process, unset/0 = off */
+    long long after = madeira_cfg_int( "yield-esc-after", 32 );          /* consecutive yields before a yield sleeps */
+    long long us = madeira_cfg_int( "yield-esc-us", 20 );                /* the first escalated sleep, microseconds */
+    long long cap = madeira_cfg_int( "yield-esc-cap-us", 100 );          /* the longest escalated sleep, microseconds */
+    long long work = madeira_cfg_int( "yield-esc-work-us", 250 );        /* own CPU time between yields that counts as work */
+
+    if (!e || !*e || (e[0] == '0' && !e[1])) { ios_yesc_mode = 0; return; }
+    ios_yesc_mode = (e[0] == '1' && !e[1]) ? 1 : 2;
+    snprintf( ios_yesc_list, sizeof(ios_yesc_list), "%s", e );
+    ios_yesc_conf.after = after < 1 ? 1 : after > 100000 ? 100000 : (unsigned int)after;
+    ios_yesc_conf.cap_us = cap < 1 ? 1 : cap > 500 ? 500 : (unsigned int)cap;   /* conservative: never above 0.5 ms */
+    ios_yesc_conf.start_us = us < 1 ? 1 : us > ios_yesc_conf.cap_us ? ios_yesc_conf.cap_us : (unsigned int)us;
+    ios_yesc_conf.work_ns = (unsigned long long)(work < 1 ? 1 : work) * 1000ull;
+    fprintf( stderr, "[yield-esc] ON for %s: after %u yields with no real wait (and < %llu us of the thread's CPU "
+             "between them) a yield sleeps %u us, doubling to %u us; any real wait resets it\n",
+             ios_yesc_mode == 1 ? "every process" : ios_yesc_list, ios_yesc_conf.after,
+             ios_yesc_conf.work_ns / 1000, ios_yesc_conf.start_us, ios_yesc_conf.cap_us );
+}
+
+static int ios_yesc_thread_on(void)
+{
+    const RTL_USER_PROCESS_PARAMETERS *pp;
+
+    if (__builtin_expect( ios_yesc_on >= 0, 1 )) return ios_yesc_on;
+    pthread_once( &ios_yesc_once, ios_yesc_init );
+    if (ios_yesc_mode <= 0) return ios_yesc_on = 0;
+    if (ios_yesc_mode == 1) return ios_yesc_on = 1;
+    if (!NtCurrentTeb() || !NtCurrentTeb()->Peb || !(pp = NtCurrentTeb()->Peb->ProcessParameters) ||
+        !pp->ImagePathName.Buffer)
+        return 0;   /* the PEB is not filled in yet: decide later */
+    ios_yesc_on = ios_yesc_image_listed( pp->ImagePathName.Buffer, pp->ImagePathName.Length / sizeof(WCHAR),
+                                         ios_yesc_list ) ? 1 : 0;
+    if (ios_yesc_on)
+    {
+        static int announced;
+        if (!__atomic_exchange_n( &announced, 1, __ATOMIC_RELAXED ))
+            fprintf( stderr, "[yield-esc] first escalating thread: %04x of %s\n",
+                     (unsigned int)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ),
+                     debugstr_us( &pp->ImagePathName ) );
+    }
+    return ios_yesc_on;
+}
+
+/* A real wait (anything but a poll) ends a spin. */
+#define IOS_YESC_WAIT(timeout) do { if (ios_yesc_on > 0 && (!(timeout) || (timeout)->QuadPart)) ios_yesc_reset( &ios_yesc ); } while (0)
+#endif
+
 NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
 {
     unsigned int ret;
@@ -3467,6 +3645,7 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
 #ifdef WINE_IOS
     LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
     timeout = ios_wait_floor( timeout, &ios_floor_store );
+    IOS_YESC_WAIT( timeout );   /* madeira-bcd yield-esc */
 #endif
 
     if (!count || count > MAXIMUM_WAIT_OBJECTS) return STATUS_INVALID_PARAMETER_1;
@@ -3549,6 +3728,7 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
 #ifdef WINE_IOS
     LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
     timeout = ios_wait_floor( timeout, &ios_floor_store );
+    IOS_YESC_WAIT( timeout );   /* madeira-bcd yield-esc */
 #endif
 
     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
@@ -3609,6 +3789,9 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
     NTSTATUS ret;
 
     TRACE( "signal %p, wait %p, alertable %u, timeout %s\n", signal, wait, alertable, debugstr_timeout(timeout) );
+#ifdef WINE_IOS
+    IOS_YESC_WAIT( timeout );   /* madeira-bcd yield-esc */
+#endif
 
     if (!signal) return STATUS_INVALID_HANDLE;
 
@@ -3630,6 +3813,28 @@ NTSTATUS WINAPI NtYieldExecution(void)
 {
     IOS_ECO_POLL();   /* ml1133 */
 #ifdef WINE_IOS
+    {   /* madeira-bcd yield-esc: per-thread counts, and the opt-in escalation (see ios_ystat_tab) */
+        struct ios_ystat *ys = ios_ystat_get();
+        if (ys && !ios_yesc_in_timed_delay) __atomic_add_fetch( &ys->yields, 1, __ATOMIC_RELAXED );
+        if (ios_yesc_in_timed_delay != 1 && ios_yesc_thread_on())
+        {
+            unsigned int us = ios_yesc_step( &ios_yesc, &ios_yesc_conf,
+                                             clock_gettime_nsec_np( CLOCK_THREAD_CPUTIME_ID ) );
+            if (us)
+            {
+                __sync_fetch_and_add( &ios_xp_yield, 1 );
+                __sync_fetch_and_add( &ios_xp_yield_esc, 1 );
+                __sync_fetch_and_add( &ios_xp_yield_esc_us, us );
+                if (ys)
+                {
+                    __atomic_add_fetch( &ys->esc, 1, __ATOMIC_RELAXED );
+                    __atomic_add_fetch( &ys->esc_us, us, __ATOMIC_RELAXED );
+                }
+                usleep( us );
+                return STATUS_SUCCESS;
+            }
+        }
+    }
     /* iOS-Madeira ml1063: ADAPTIVE YIELD. A game thread that spins
      * WaitForSingleObject(h, 0) / SwitchToThread() waiting for work keeps a whole
      * core at 100 % (sampled: one such thread pegged for the entire benchmark,
@@ -3713,6 +3918,11 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
 #ifdef WINE_IOS
     LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
     timeout = ios_wait_floor( timeout, &ios_floor_store );
+    IOS_YESC_WAIT( timeout );   /* madeira-bcd yield-esc */
+    {   /* madeira-bcd yield-esc: Sleep(0) and short timed sleeps per thread */
+        struct ios_ystat *ys = timeout && timeout->QuadPart <= 0 && timeout->QuadPart > -50000 ? ios_ystat_get() : NULL;
+        if (ys) __atomic_add_fetch( timeout->QuadPart ? &ys->shortsleep : &ys->zero, 1, __ATOMIC_RELAXED );
+    }
 #endif
 
     /* if alertable, we need to query the server */
@@ -3742,7 +3952,13 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
 
         /* Note that we yield after establishing the desired timeout, but
            we only care about the result of the yield for zero timeouts */
+#ifdef WINE_IOS
+        ios_yesc_in_timed_delay = when ? 1 : 2;   /* madeira-bcd yield-esc: 1 = not a spin yield, 2 = Sleep(0) */
+#endif
         status = NtYieldExecution();
+#ifdef WINE_IOS
+        ios_yesc_in_timed_delay = 0;
+#endif
         if (!when) return status;
 
         for (;;)
@@ -3976,6 +4192,9 @@ NTSTATUS WINAPI NtWaitForKeyedEvent( HANDLE handle, const void *key,
     UINT flags = SELECT_INTERRUPTIBLE;
 
     TRACE( "handle %p, key %p, alertable %u, timeout %s\n", handle, key, alertable, debugstr_timeout(timeout) );
+#ifdef WINE_IOS
+    IOS_YESC_WAIT( timeout );   /* madeira-bcd yield-esc */
+#endif
 
     if (!handle) handle = keyed_event;
     if ((ULONG_PTR)key & 1) return STATUS_INVALID_PARAMETER_1;
@@ -4129,6 +4348,7 @@ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *
 #ifdef WINE_IOS
     LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
     timeout = (LARGE_INTEGER *)ios_wait_floor( timeout, &ios_floor_store );
+    IOS_YESC_WAIT( timeout );   /* madeira-bcd yield-esc */
 #endif
 
     SERVER_START_REQ( remove_completion )
@@ -4180,6 +4400,7 @@ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORM
 #ifdef WINE_IOS
     LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
     timeout = (LARGE_INTEGER *)ios_wait_floor( timeout, &ios_floor_store );
+    IOS_YESC_WAIT( timeout );   /* madeira-bcd yield-esc */
 #endif
 
     if (!count) return STATUS_INVALID_PARAMETER;
@@ -5400,6 +5621,7 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
 #ifdef WINE_IOS
     LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
     timeout = ios_wait_floor( timeout, &ios_floor_store );
+    IOS_YESC_WAIT( timeout );   /* madeira-bcd yield-esc */
 #endif
     __sync_fetch_and_add( &ios_alert_waits, 1 );   /* ml1115 */
     union tid_alert_entry *entry = get_tid_alert_entry( NtCurrentTeb()->ClientId.UniqueThread );

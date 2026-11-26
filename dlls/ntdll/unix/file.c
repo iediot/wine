@@ -9270,6 +9270,13 @@ static void *put_object_type_info( OBJECT_TYPE_INFORMATION *p, struct object_typ
     return (char *)(p + 1) + ((p->TypeName.MaximumLength + align) & ~align);
 }
 
+#ifdef WINE_IOS
+/* madeira: build/ntdll-unix/regcache_ios.c. A key handle the registry read cache
+ * answered an open with becomes a real handle before it reaches the server. */
+extern int ios_regcache_on;
+extern NTSTATUS ios_regcache_real( HANDLE *handle, const char *op );
+#endif
+
 /**************************************************************************
  *           NtQueryObject   (NTDLL.@)
  */
@@ -9281,6 +9288,9 @@ NTSTATUS WINAPI NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_clas
     TRACE("(%p,0x%08x,%p,0x%08x,%p)\n", handle, info_class, ptr, len, used_len);
 
     if (used_len) *used_len = 0;
+#ifdef WINE_IOS
+    if (ios_regcache_on > 0 && (status = ios_regcache_real( &handle, NULL ))) return status;
+#endif
 
     switch (info_class)
     {
@@ -9452,6 +9462,9 @@ NTSTATUS WINAPI NtSetInformationObject( HANDLE handle, OBJECT_INFORMATION_CLASS 
 
     TRACE("(%p,0x%08x,%p,0x%08x)\n", handle, info_class, ptr, len);
 
+#ifdef WINE_IOS
+    if (ios_regcache_on > 0 && (status = ios_regcache_real( &handle, NULL ))) return status;
+#endif
     switch (info_class)
     {
     case ObjectHandleFlagInformation:

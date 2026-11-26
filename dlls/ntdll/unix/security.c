@@ -983,6 +983,16 @@ NTSTATUS WINAPI NtCloseObjectAuditAlarm( UNICODE_STRING *subsystem, HANDLE handl
 }
 
 
+#ifdef WINE_IOS
+/* madeira: build/ntdll-unix/regcache_ios.c. A key handle the registry read cache
+ * answered an open with becomes a real handle before it reaches the server, and a
+ * security change counts as a registry write (it can change what an open returns). */
+extern int ios_regcache_on;
+extern NTSTATUS ios_regcache_real( HANDLE *handle, const char *op );
+extern void ios_regcache_write_begin( void );
+extern void ios_regcache_write_end( int changed );
+#endif
+
 /***********************************************************************
  *             NtQuerySecurityObject  (NTDLL.@)
  */
@@ -996,6 +1006,9 @@ NTSTATUS WINAPI NtQuerySecurityObject( HANDLE handle, SECURITY_INFORMATION info,
 
     TRACE( "(%p,0x%08x,%p,0x%08x,%p)\n", handle, info, descr, length, retlen );
 
+#ifdef WINE_IOS
+    if (ios_regcache_on > 0 && (status = ios_regcache_real( &handle, NULL ))) return status;
+#endif
     for (;;)
     {
         if (!(buffer = malloc( buffer_size ))) return STATUS_NO_MEMORY;
@@ -1075,6 +1088,14 @@ NTSTATUS WINAPI NtSetSecurityObject( HANDLE handle, SECURITY_INFORMATION info, P
     if (info & (SACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION)) sd->control |= SE_SACL_PRESENT;
     if (info & DACL_SECURITY_INFORMATION) sd->control |= SE_DACL_PRESENT;
 
+#ifdef WINE_IOS
+    if (ios_regcache_on > 0 && (status = ios_regcache_real( &handle, NULL )))
+    {
+        free( objattr );
+        return status;
+    }
+    ios_regcache_write_begin();
+#endif
     SERVER_START_REQ( set_security_object )
     {
         req->handle = wine_server_obj_handle( handle );
@@ -1083,6 +1104,9 @@ NTSTATUS WINAPI NtSetSecurityObject( HANDLE handle, SECURITY_INFORMATION info, P
         status = wine_server_call( req );
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    ios_regcache_write_end( 1 );
+#endif
     free( objattr );
     return status;
 }

@@ -1363,10 +1363,90 @@ static inline BOOL futex_queue_idle( struct futex_queue *queue )
     return !next || next == &queue->queue;
 }
 
+/* iOS-Madeira 2026-11-27: the bucket lock holds the holder's thread id, and a
+ * waiter that cannot get it backs off instead of spinning without end.
+ *
+ * The table above is shared by every thread of every pseudo-process, and the
+ * holder can be preempted between spin_lock and spin_unlock. With per-thread
+ * QoS classes (MADEIRA_THREAD_QOS) a background-class holder is not scheduled
+ * while higher-class threads spin on its bucket: in RDR2 logs 2026-11-26 20:11
+ * and 2026-11-27 00:19 every Social Club helper thread left above background
+ * (HangWatcher, NetworkService, CacheThread_BlockFile, wine_threadpool_waitqueue,
+ * two unnamed) ran ~1 core each at ~6 instructions per cycle -- only a short
+ * loop without system calls gets there -- for 40 s and for 6+ minutes, while the
+ * named Chrome threads at background stayed idle. This spin is such a loop and
+ * had no bound; [futex-spin] below shows whether it is the one. After 128
+ * failed tries the waiter yields, after 160
+ * it sleeps (50 us, then 0.5 ms: under 1 ms, so env.MADEIRA_WAIT_FLOOR never
+ * stretches it), so a preempted holder gets a core. A wait that lasts ~70 ms,
+ * ~1 s and every ~5 s after is logged with the holder's tid and
+ * whether that thread still exists ([futex-spin]); -1 is the unix-side reaper
+ * (ios_shared_futex_wake). Uncontended cost is unchanged. */
+static LONG futex_spin_reports;
+
+static void futex_spin_report( LONG *lock, LONG owner, unsigned int sleeps )
+{
+    THREAD_BASIC_INFORMATION tbi;
+    OBJECT_ATTRIBUTES attr;
+    CLIENT_ID cid;
+    HANDLE thread = 0;
+    NTSTATUS status = STATUS_INVALID_CID;
+    ULONG_PTR owner_pid = 0;
+    LONG exit_status = 0;
+    LONG n = InterlockedIncrement( &futex_spin_reports );
+
+    if (n > 64) return;
+    if (owner > 0)
+    {
+        InitializeObjectAttributes( &attr, NULL, 0, NULL, NULL );
+        cid.UniqueProcess = 0;
+        cid.UniqueThread = ULongToHandle( owner );
+        status = NtOpenThread( &thread, THREAD_QUERY_LIMITED_INFORMATION, &attr, &cid );
+        if (!status)
+        {
+            if (!NtQueryInformationThread( thread, ThreadBasicInformation, &tbi, sizeof(tbi), NULL ))
+            {
+                owner_pid = (ULONG_PTR)tbi.ClientId.UniqueProcess;
+                exit_status = tbi.ExitStatus;
+            }
+            NtClose( thread );
+        }
+    }
+    ERR( "[futex-spin] #%ld bucket %ld held by tid %04lx (pid %04Ix, %s) while tid %04lx waited ~%u ms "
+         "(%u back-off sleeps)\n",
+         n, (long)(((char *)lock - (char *)ios_get_futex_table()) / (LONG)sizeof(struct futex_queue)),
+         owner, owner_pid,
+         owner == -1 ? "unix-side reaper" : status ? "thread NOT FOUND -- died holding it"
+                     : exit_status == STATUS_PENDING ? "alive" : "exited",
+         GetCurrentThreadId(), sleeps < 64 ? sleeps / 20 : 3 + (sleeps - 64) / 2, sleeps );
+}
+
 static void spin_lock( LONG *lock )
 {
-    while (InterlockedCompareExchange( lock, -1, 0 ))
-        YieldProcessor();
+    LONG self = (LONG)GetCurrentThreadId(), owner;
+    unsigned int spins = 0, sleeps = 0;
+
+    if (!self) self = -1;
+    while ((owner = InterlockedCompareExchange( lock, self, 0 )))
+    {
+        LARGE_INTEGER delay;
+
+        if (++spins < 128)
+        {
+            YieldProcessor();
+            continue;
+        }
+        if (spins < 160)
+        {
+            NtYieldExecution();
+            continue;
+        }
+        delay.QuadPart = sleeps < 64 ? -500 /* 50 us */ : -5000 /* 0.5 ms */;
+        NtDelayExecution( FALSE, &delay );
+        sleeps++;
+        if (sleeps == 200 || sleeps == 2000 || (sleeps > 2000 && !(sleeps % 10000)))
+            futex_spin_report( lock, owner, sleeps );
+    }
 }
 
 static void spin_unlock( LONG *lock )

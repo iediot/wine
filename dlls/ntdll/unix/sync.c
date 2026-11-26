@@ -3447,6 +3447,12 @@ NTSTATUS WINAPI NtQueryTimer( HANDLE handle, TIMER_INFORMATION_CLASS class,
 /******************************************************************
  *		NtWaitForMultipleObjects (NTDLL.@)
  */
+#ifdef WINE_IOS
+/* madeira-bcd wait-floor: env.MADEIRA_WAIT_FLOOR raises short timed waits of chosen
+ * processes while a game runs (process_ios.c); returns `timeout` or `store` */
+extern const LARGE_INTEGER *ios_wait_floor( const LARGE_INTEGER *timeout, LARGE_INTEGER *store );
+#endif
+
 NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WAIT_TYPE type,
                                           BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
@@ -3458,6 +3464,10 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
 #endif
 
     IOS_ECO_POLL();   /* ml1133 */
+#ifdef WINE_IOS
+    LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
+    timeout = ios_wait_floor( timeout, &ios_floor_store );
+#endif
 
     if (!count || count > MAXIMUM_WAIT_OBJECTS) return STATUS_INVALID_PARAMETER_1;
     if (type != WaitAll && type != WaitAny) FIXME( "Unsupported wait type %u\n", type );
@@ -3536,6 +3546,10 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
 #endif
 
     IOS_ECO_POLL();   /* ml1133 */
+#ifdef WINE_IOS
+    LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
+    timeout = ios_wait_floor( timeout, &ios_floor_store );
+#endif
 
     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
 
@@ -3696,6 +3710,10 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
         __sync_fetch_and_add( &ios_xp_delay, 1 );
         __sync_fetch_and_add( &ios_xp_delay_hist[d < 0 ? 5 : d == 0 ? 0 : d < 10000 ? 1 : d < 50000 ? 2 : d < 200000 ? 3 : 4], 1 );
     }
+#ifdef WINE_IOS
+    LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
+    timeout = ios_wait_floor( timeout, &ios_floor_store );
+#endif
 
     /* if alertable, we need to query the server */
     if (alertable)
@@ -4108,6 +4126,10 @@ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *
     unsigned int status;
 
     TRACE( "(%p, %p, %p, %p, %p)\n", handle, key, value, io, timeout );
+#ifdef WINE_IOS
+    LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
+    timeout = (LARGE_INTEGER *)ios_wait_floor( timeout, &ios_floor_store );
+#endif
 
     SERVER_START_REQ( remove_completion )
     {
@@ -4155,6 +4177,10 @@ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORM
     ULONG i = 0;
 
     TRACE( "%p %p %u %p %p %u\n", handle, info, count, written, timeout, alertable );
+#ifdef WINE_IOS
+    LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
+    timeout = (LARGE_INTEGER *)ios_wait_floor( timeout, &ios_floor_store );
+#endif
 
     if (!count) return STATUS_INVALID_PARAMETER;
 
@@ -5371,6 +5397,10 @@ static LONGLONG update_timeout( ULONGLONG end )
 NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
 {
     IOS_ECO_POLL();   /* ml1133 */
+#ifdef WINE_IOS
+    LARGE_INTEGER ios_floor_store;   /* madeira-bcd wait-floor (process_ios.c ios_wait_floor) */
+    timeout = ios_wait_floor( timeout, &ios_floor_store );
+#endif
     __sync_fetch_and_add( &ios_alert_waits, 1 );   /* ml1115 */
     union tid_alert_entry *entry = get_tid_alert_entry( NtCurrentTeb()->ClientId.UniqueThread );
     /* iOS-Madeira ml406 (task #60): unix-side tap for beacon-marked threads

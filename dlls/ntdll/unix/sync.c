@@ -1154,6 +1154,33 @@ static int madeira_desync_logged;
 static int madeira_fast_asked;        /* what MADEIRA_FASTSYNC asked for      */
 static int madeira_fast_announced;
 
+/* ml2120: per-image opt-ins, each a ';' or ',' separated list of image names
+ * ("RDR2.exe"), "1" or "all" for every process, unset, empty or "0" for off:
+ *   MADEIRA_FASTSYNC_SEM_EXES  the semaphore fast path, for the listed images
+ *                              only (server/event.c reads the same variable
+ *                              and gives cells only to the semaphores those
+ *                              images create)
+ *   MADEIRA_FASTSYNC_MULTI     the multi-object WaitAny fast path
+ *                              (madeira_fast_wait_multi below)
+ * Both need fastsync's cells, so neither does anything with fastsync off or
+ * under madsync.  Read once per app run, decided once per thread (a thread
+ * belongs to one process, and every guest process shares this library). */
+static char madeira_fast_sem_exes[256];
+static char madeira_fast_multi_exes[256];
+static int madeira_fast_sem_exes_on;
+static int madeira_fast_multi_on;
+static __thread signed char madeira_fast_sem_me = -1;     /* this thread: -1 = not decided yet */
+static __thread signed char madeira_fast_multi_me = -1;
+/* MADEIRA_FASTSYNC_MULTI_PARKED: how many threads may park in a multi wait at
+ * once (each kick of a cell they wait on wakes all of them); the next one goes
+ * to the server.  1..32, default 4. */
+static unsigned int madeira_multi_max_parked = 4;
+
+static int madeira_fast_list_set( const char *e )
+{
+    return e && *e && !(e[0] == '0' && !e[1]);
+}
+
 static int madeira_env_is( const char *e, const char *a, const char *b, const char *c )
 {
     return e && (!strcmp( e, a ) || !strcmp( e, b ) || (c && !strcmp( e, c )));
@@ -1202,6 +1229,25 @@ static void madeira_fast_parse_env(void)
         if (us > 1000) us = 1000;
         madeira_fast_spin_ns = (unsigned long long)us * 1000;
     }
+    {
+        int sem_exes, multi;
+
+        e = getenv( "MADEIRA_FASTSYNC_SEM_EXES" );   /* semaphore cells and fast path for these images only (RDR2.exe; ; or , between; 1 = every process), unset/0 = off */
+        sem_exes = mode != MADEIRA_FS_MODE_OFF && madeira_fast_list_set( e );
+        if (sem_exes) snprintf( madeira_fast_sem_exes, sizeof(madeira_fast_sem_exes), "%s", e );
+        e = getenv( "MADEIRA_FASTSYNC_MULTI" );   /* WaitForMultipleObjects (wait-any, not alertable) fast path for these images (RDR2.exe; ; or , between; 1 = every process), unset/0 = off */
+        multi = mode != MADEIRA_FS_MODE_OFF && madeira_fast_list_set( e );
+        if (multi) snprintf( madeira_fast_multi_exes, sizeof(madeira_fast_multi_exes), "%s", e );
+        if ((e = getenv( "MADEIRA_FASTSYNC_MULTI_PARKED" )))   /* multi waits parked at once before the next goes to the server, 1..32 (4) */
+        {
+            unsigned long n = strtoul( e, NULL, 10 );
+            if (n < 1) n = 1;
+            if (n > 32) n = 32;
+            madeira_multi_max_parked = (unsigned int)n;
+        }
+        __atomic_store_n( &madeira_fast_sem_exes_on, sem_exes, __ATOMIC_RELAXED );
+        __atomic_store_n( &madeira_fast_multi_on, multi, __ATOMIC_RELAXED );
+    }
 
     __atomic_store_n( &madeira_fast_peek, peek, __ATOMIC_RELAXED );
     __atomic_store_n( &madeira_fast_sem, sem, __ATOMIC_RELAXED );
@@ -1236,6 +1282,29 @@ static void madeira_fast_announce(void)
              madeira_fast_peek ? "on" : "off", madeira_fast_sem ? "on" : "off",
              (unsigned int)MADEIRA_SYNC_CELLS, (unsigned int)(madeira_fast_cap_ns / 1000),
              madeira_fast_spin_ns / 1000, madeira_fast_auto_reqs );
+    if (mode != MADEIRA_FS_MODE_OFF &&
+        (madeira_fast_sem_exes_on || madeira_fast_multi_on))
+        ERR( "[fastsync] ml2120 per-image: semaphore fast path for %s; multi-object wait-any fast path for %s\n",
+             madeira_fast_sem_exes_on ? madeira_fast_sem_exes : "(MADEIRA_FASTSYNC_SEM_EXES unset)",
+             madeira_fast_multi_on ? madeira_fast_multi_exes : "(MADEIRA_FASTSYNC_MULTI unset)" );
+}
+
+/* ml2120: is this thread's process image in `list'?  Cached per thread in
+ * *me once the PEB says; until then the answer is "no" and nothing is cached. */
+static int ios_yesc_image_listed( const WCHAR *path, int len, const char *list );   /* below */
+
+static int madeira_fast_image_flag( signed char *me, const char *list )
+{
+    const RTL_USER_PROCESS_PARAMETERS *pp;
+    TEB *teb;
+
+    if (*me >= 0) return *me;
+    if ((list[0] == '1' && !list[1]) || !strcmp( list, "all" )) return *me = 1;
+    if (!(teb = NtCurrentTeb()) || !teb->Peb || !(pp = teb->Peb->ProcessParameters) ||
+        !pp->ImagePathName.Buffer)
+        return 0;
+    return *me = ios_yesc_image_listed( pp->ImagePathName.Buffer, pp->ImagePathName.Length / sizeof(WCHAR),
+                                        list ) ? 1 : 0;
 }
 
 /* "does the server keep state in a cell we may READ" */
@@ -1249,7 +1318,10 @@ static inline int madeira_fast_cells_enabled(void)
 static inline int madeira_fast_sem_enabled(void)
 {
     madeira_fast_init();
-    return __atomic_load_n( &madeira_fast_sem, __ATOMIC_RELAXED );
+    if (__atomic_load_n( &madeira_fast_sem, __ATOMIC_RELAXED )) return 1;
+    /* ml2120: MADEIRA_FASTSYNC_SEM_EXES, for this thread's image only */
+    if (!__atomic_load_n( &madeira_fast_sem_exes_on, __ATOMIC_RELAXED )) return 0;
+    return madeira_fast_image_flag( &madeira_fast_sem_me, madeira_fast_sem_exes );
 }
 
 /* CLOCK_UPTIME_RAW, the clock the park's OS_CLOCK_MACH_ABSOLUTE_TIME counts
@@ -1624,6 +1696,7 @@ static enum madeira_fast_result madeira_fast_sem_release( HANDLE handle, ULONG c
      * waiter woken with nothing left for it re-parks. */
     if (count && __atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
         madeira_fast_wake( madeira_cell_futex( cell ), count > 1 );
+    if (count) madeira_cell_kick_multi( cell );   /* ml2120: pairing (3) */
 
     /* Dekker pairing (1): the server must re-run its own queue, with a
      * release of ZERO; releasing again here would mint a second set of
@@ -1672,6 +1745,7 @@ static enum madeira_fast_result madeira_fast_event_op( HANDLE handle, int set, L
 
     if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
         madeira_fast_wake( madeira_cell_futex( cell ), manual );
+    madeira_cell_kick_multi( cell );   /* ml2120: pairing (3) */
 
     /* the caller then sends MADEIRA_EVENT_OP_WAKE, never a second SET_EVENT */
     if (__atomic_load_n( &cell->srv_waiters, __ATOMIC_SEQ_CST )) return MADEIRA_FAST_SERVER;
@@ -1926,6 +2000,314 @@ static unsigned int madeira_fast_watched_wait( const union select_op *op, data_s
             if (ms > MADEIRA_FS_WATCH_MS_MAX) ms = MADEIRA_FS_WATCH_MS_MAX;
         }
     }
+}
+
+/***********************************************************************
+ *   ml2120 MADEIRA_FASTSYNC_MULTI: the multi-object WaitAny fast path
+ *
+ * WaitForMultipleObjects( n > 1, ..., WaitAny ) that is not alertable and
+ * whose handles ALL resolve to live cells (events, and semaphores where the
+ * semaphore path applies to this thread).  Anything else -- a mutex, a
+ * thread, a file, the message queue a MsgWaitForMultipleObjects adds, a
+ * wait-all, an alertable wait, an absolute deadline once the first look
+ * fails -- goes to the server exactly as before.
+ *
+ * The answer is the one Windows gives: the LOWEST index that is signalled.
+ *   1. One pass reads every cell in index order and stops at the first
+ *      signalled one, k; a cell that changed hands or left the fast path
+ *      sends the whole wait to the server with nothing taken.
+ *   2. The cells before k are read once more, BEFORE anything is taken; if
+ *      one of them is signalled now, it looks again.  This is what keeps the
+ *      order a thread creates: one that sets j and then k (j < k) is always
+ *      answered j, because the pass's read of k saw k's set, j's set came
+ *      before that, and this second read comes after it -- so it sees j set,
+ *      unless another waiter consumed j first, which Windows allows too.
+ *   3. The token of k is taken with a CAS from exactly the word the pass read
+ *      (a manual-reset event is not consumed); a lost CAS looks again.
+ *   Nothing is ever taken and handed back, so no ResetEvent, release or
+ *   poll in between can see a token appear or vanish that Windows would not
+ *   show.  More than MADEIRA_MULTI_MAX_TRIES re-looks in one call (heavy
+ *   churn) hand the wait to the server, untouched.
+ * Then the isb ladder, then a park on madeira_multi_epoch (pairing (3) in
+ * wine/madeira_fastsync.h) for at most the fast cap (2 ms, MADEIRA_FASTSYNC_
+ * CAP_US), never past the caller's relative timeout, after which the wait goes
+ * to the server with the remaining time -- so a system APC queued to this
+ * thread waits at most the cap, as for a single fast wait.  At most
+ * MADEIRA_FASTSYNC_MULTI_PARKED threads (4) park at once, because each kick
+ * wakes them all; the next one goes to the server.  A zero timeout gets one look and the
+ * server answers a miss; an absolute timeout likewise.
+ *
+ * Off unless MADEIRA_FASTSYNC_MULTI lists this thread's image; it needs the
+ * wake path armed (fastsync auto/1) and does not count towards arming it.
+ ***********************************************************************/
+
+#define MADEIRA_MULTI_LADDER       24    /* passes with an isb between them before parking */
+#define MADEIRA_MULTI_MAX_TRIES    16    /* lost CASes / re-looks per call before the server */
+#define MADEIRA_MULTI_MAX_ROUNDS  256    /* park rounds per call, independent of the clock */
+
+#define MADEIRA_MULTI_NONE   (-1)        /* nothing signalled (yet) */
+#define MADEIRA_MULTI_BAD    (-2)        /* a cell changed hands or left the fast path: the server */
+#define MADEIRA_MULTI_RETRY  (-3)        /* raced: look again */
+#define MADEIRA_MULTI_BUSY   (-4)        /* raced too often: the server */
+#define MADEIRA_MULTI_HERD   (-5)        /* enough threads parked already: the server */
+
+static unsigned int madeira_multi_parked;   /* threads parked on madeira_multi_epoch now */
+
+/* Step 1: the lowest signalled index, NONE, or BAD.  *sg_out is the word the
+ * answer was read from. */
+static int madeira_multi_pass( struct madeira_sync_cell *const *cells, const unsigned int *gens,
+                               const unsigned int *manuals, const unsigned int *kinds,
+                               unsigned int count, uint64_t *sg_out )
+{
+    unsigned int i;
+
+    for (i = 0; i < count; i++)
+    {
+        uint64_t sg = __atomic_load_n( &cells[i]->sg, __ATOMIC_SEQ_CST );
+        int st = MADEIRA_SG_STATE( sg );
+
+        if (MADEIRA_SG_GEN( sg ) != gens[i] || st == MADEIRA_CELL_DISABLED) return MADEIRA_MULTI_BAD;
+        if (madeira_cell_signalled( kinds[i], manuals[i], st ))
+        {
+            *sg_out = sg;
+            return (int)i;
+        }
+    }
+    return MADEIRA_MULTI_NONE;
+}
+
+/* Step 3: take the token the pass saw, from exactly the word it saw. */
+static int madeira_multi_take( struct madeira_sync_cell *cell, unsigned int manual, unsigned int kind,
+                               uint64_t sg )
+{
+    unsigned int gen = MADEIRA_SG_GEN( sg );
+    int st = MADEIRA_SG_STATE( sg );
+
+    if (kind == MADEIRA_CELL_KIND_SEM)
+        return __atomic_compare_exchange_n( &cell->sg, &sg, MADEIRA_SG( gen, st - 1 ), 0,
+                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
+    if (manual) return 1;
+    return __atomic_compare_exchange_n( &cell->sg, &sg, MADEIRA_SG( gen, MADEIRA_CELL_RESET ), 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
+}
+
+/* Step 2: is any cell before k signalled now?  A cell that changed hands or
+ * left the fast path since the pass counts as not signalled here; the next
+ * pass reports it as BAD. */
+static int madeira_multi_earlier( struct madeira_sync_cell *const *cells, const unsigned int *gens,
+                                  const unsigned int *manuals, const unsigned int *kinds, unsigned int k )
+{
+    unsigned int i;
+
+    for (i = 0; i < k; i++)
+    {
+        uint64_t sg = __atomic_load_n( &cells[i]->sg, __ATOMIC_SEQ_CST );
+        int st = MADEIRA_SG_STATE( sg );
+
+        if (MADEIRA_SG_GEN( sg ) != gens[i] || st == MADEIRA_CELL_DISABLED) continue;
+        if (madeira_cell_signalled( kinds[i], manuals[i], st )) return 1;
+    }
+    return 0;
+}
+
+/* Steps 1-3 once: the index taken, NONE, BAD or RETRY. */
+static int madeira_multi_attempt( struct madeira_sync_cell *const *cells, const unsigned int *gens,
+                                  const unsigned int *manuals, const unsigned int *kinds,
+                                  unsigned int count )
+{
+    uint64_t sg = 0;
+    int k = madeira_multi_pass( cells, gens, manuals, kinds, count, &sg );
+
+    if (k < 0) return k;
+    if (k && madeira_multi_earlier( cells, gens, manuals, kinds, (unsigned int)k )) return MADEIRA_MULTI_RETRY;
+    if (!madeira_multi_take( cells[k], manuals[k], kinds[k], sg )) return MADEIRA_MULTI_RETRY;
+    return k;
+}
+
+/* The whole fast wait: the index taken, NONE (budget spent, or one look when
+ * !may_wait), BAD, BUSY or HERD.  *phase: 0 = first look, 1 = isb ladder,
+ * 2 = parked; *parks counts the park calls (wakes, spurious ones included). */
+static int madeira_multi_core( struct madeira_sync_cell *const *cells, const unsigned int *gens,
+                               const unsigned int *manuals, const unsigned int *kinds, unsigned int count,
+                               int may_wait, unsigned long long budget_ns, int *phase, unsigned int *parks )
+{
+    unsigned long long t0, spent;
+    unsigned int i, tries = 0, rounds;
+    int k;
+
+    *phase = 0;
+    *parks = 0;
+    for (i = 0; ; )
+    {
+        k = madeira_multi_attempt( cells, gens, manuals, kinds, count );
+        if (k >= 0 || k == MADEIRA_MULTI_BAD) return k;
+        if (k == MADEIRA_MULTI_RETRY)
+        {
+            if (++tries > MADEIRA_MULTI_MAX_TRIES) return MADEIRA_MULTI_BUSY;
+            continue;
+        }
+        if (!may_wait || ++i > MADEIRA_MULTI_LADDER) break;
+        *phase = 1;
+        __asm__ __volatile__( "isb" ::: "memory" );
+    }
+    if (!may_wait || !budget_ns) return MADEIRA_MULTI_NONE;
+
+    if (__atomic_add_fetch( &madeira_multi_parked, 1, __ATOMIC_SEQ_CST ) > madeira_multi_max_parked)
+    {
+        __atomic_sub_fetch( &madeira_multi_parked, 1, __ATOMIC_SEQ_CST );
+        return MADEIRA_MULTI_HERD;
+    }
+    for (i = 0; i < count; i++) __atomic_add_fetch( &cells[i]->mwaiters, 1, __ATOMIC_SEQ_CST );
+    *phase = 2;
+
+    k = MADEIRA_MULTI_NONE;
+    t0 = madeira_now_ns();
+    for (rounds = 0; rounds < MADEIRA_MULTI_MAX_ROUNDS; rounds++)
+    {
+        unsigned int epoch;
+
+        spent = madeira_now_ns() - t0;
+        if (spent >= budget_ns)
+        {
+            k = MADEIRA_MULTI_NONE;
+            break;
+        }
+        /* pairing (3): registered above, epoch before the states */
+        epoch = __atomic_load_n( &madeira_multi_epoch, __ATOMIC_SEQ_CST );
+        k = madeira_multi_attempt( cells, gens, manuals, kinds, count );
+        if (k >= 0 || k == MADEIRA_MULTI_BAD) break;
+        if (k == MADEIRA_MULTI_RETRY)
+        {
+            if (++tries > MADEIRA_MULTI_MAX_TRIES)
+            {
+                k = MADEIRA_MULTI_BUSY;
+                break;
+            }
+            continue;
+        }
+        /* the value is re-tested inside the syscall */
+        madeira_fast_park( (const int *)&madeira_multi_epoch, (int)epoch, budget_ns - spent );
+        ++*parks;
+        k = MADEIRA_MULTI_NONE;
+    }
+
+    /* a recycled cell's count belongs to its new occupant (the allocator zeroed it) */
+    for (i = 0; i < count; i++)
+        if (madeira_cell_alive( cells[i], gens[i] ))
+            __atomic_sub_fetch( &cells[i]->mwaiters, 1, __ATOMIC_SEQ_CST );
+    __atomic_sub_fetch( &madeira_multi_parked, 1, __ATOMIC_SEQ_CST );
+    return k;
+}
+
+/* Counters for the report line, every 30 s while multi waits arrive. */
+static struct
+{
+    unsigned int calls, nocell, first, ladder, parked, none, bad, busy, herd, parks;
+    unsigned long long t_last;
+} madeira_multi_stats;
+
+static void madeira_multi_report(void)
+{
+    unsigned long long now = madeira_now_ns();
+    unsigned long long last = __atomic_load_n( &madeira_multi_stats.t_last, __ATOMIC_RELAXED );
+    unsigned int calls, nocell, first, ladder, parked, none, bad, busy, herd, parks;
+
+    if (!last)
+    {
+        __atomic_compare_exchange_n( &madeira_multi_stats.t_last, &last, now, 0,
+                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED );
+        return;
+    }
+    if (now - last < 30000000000ull) return;
+    if (!__atomic_compare_exchange_n( &madeira_multi_stats.t_last, &last, now, 0,
+                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED )) return;
+    calls  = __atomic_exchange_n( &madeira_multi_stats.calls,      0, __ATOMIC_RELAXED );
+    nocell = __atomic_exchange_n( &madeira_multi_stats.nocell,     0, __ATOMIC_RELAXED );
+    first  = __atomic_exchange_n( &madeira_multi_stats.first,      0, __ATOMIC_RELAXED );
+    ladder = __atomic_exchange_n( &madeira_multi_stats.ladder,     0, __ATOMIC_RELAXED );
+    parked = __atomic_exchange_n( &madeira_multi_stats.parked,     0, __ATOMIC_RELAXED );
+    none   = __atomic_exchange_n( &madeira_multi_stats.none,       0, __ATOMIC_RELAXED );
+    bad    = __atomic_exchange_n( &madeira_multi_stats.bad,        0, __ATOMIC_RELAXED );
+    busy   = __atomic_exchange_n( &madeira_multi_stats.busy,       0, __ATOMIC_RELAXED );
+    herd   = __atomic_exchange_n( &madeira_multi_stats.herd,       0, __ATOMIC_RELAXED );
+    parks  = __atomic_exchange_n( &madeira_multi_stats.parks,      0, __ATOMIC_RELAXED );
+    fprintf( stderr, "[fastsync] ml2120 multi-wait %.0fs: %u calls; no server %u (first look %u, spin %u, "
+             "parked %u); server %u (a handle without a cell %u, cap/timeout/poll %u, park limit %u, "
+             "cell changed %u, churn %u); %u parks; parked now %u of %u\n",
+             (now - last) / 1e9, calls, first + ladder + parked, first, ladder, parked,
+             nocell + none + bad + busy + herd, nocell, none, herd, bad, busy, parks,
+             __atomic_load_n( &madeira_multi_parked, __ATOMIC_RELAXED ), madeira_multi_max_parked );
+}
+
+/* Returns STATUS_WAIT_0 + index when answered here, or STATUS_NOT_IMPLEMENTED
+ * for "go to the server", with *fallback the timeout to use from here (a
+ * relative timeout less what was spent here, as madeira_fast_wait does). */
+static NTSTATUS madeira_fast_wait_multi( DWORD count, const HANDLE *handles, const LARGE_INTEGER *timeout,
+                                         const LARGE_INTEGER **fallback, LARGE_INTEGER *store )
+{
+    struct madeira_sync_cell *cells[MAXIMUM_WAIT_OBJECTS];
+    unsigned int gens[MAXIMUM_WAIT_OBJECTS], manuals[MAXIMUM_WAIT_OBJECTS], kinds[MAXIMUM_WAIT_OBJECTS];
+    unsigned long long budget_ns = 0, t0;
+    int k, phase, may_wait;
+    unsigned int parks;
+    DWORD i;
+
+    *fallback = timeout;
+    if (count < 2 || count > MAXIMUM_WAIT_OBJECTS) return STATUS_NOT_IMPLEMENTED;
+    madeira_fast_init();
+    if (!__atomic_load_n( &madeira_fast_multi_on, __ATOMIC_RELAXED )) return STATUS_NOT_IMPLEMENTED;
+    if (!madeira_fast_image_flag( &madeira_fast_multi_me, madeira_fast_multi_exes )) return STATUS_NOT_IMPLEMENTED;
+    if (!madeira_fast_armed()) return STATUS_NOT_IMPLEMENTED;
+
+    if (!(__atomic_add_fetch( &madeira_multi_stats.calls, 1, __ATOMIC_RELAXED ) & 1023))
+        madeira_multi_report();
+
+    /* last handle first: a MsgWaitForMultipleObjects array ends in the
+     * message queue, which never has a cell, so that miss costs one lookup */
+    for (i = count; i-- > 0; )
+    {
+        if (!(cells[i] = madeira_fast_lookup( handles[i], SYNCHRONIZE, &manuals[i], &gens[i], &kinds[i] )))
+        {
+            __atomic_add_fetch( &madeira_multi_stats.nocell, 1, __ATOMIC_RELAXED );
+            return STATUS_NOT_IMPLEMENTED;
+        }
+    }
+
+    may_wait = !timeout || timeout->QuadPart < 0;
+    if (may_wait)
+    {
+        budget_ns = madeira_fast_cap_ns;
+        if (timeout && (unsigned long long)(-timeout->QuadPart) * 100 < budget_ns)
+            budget_ns = (unsigned long long)(-timeout->QuadPart) * 100;
+    }
+    t0 = madeira_now_ns();
+    k = madeira_multi_core( cells, gens, manuals, kinds, count, may_wait, budget_ns, &phase, &parks );
+    if (parks) __atomic_add_fetch( &madeira_multi_stats.parks, parks, __ATOMIC_RELAXED );
+    if (k >= 0)
+    {
+        __atomic_add_fetch( phase == 0 ? &madeira_multi_stats.first : phase == 1 ? &madeira_multi_stats.ladder
+                                                                                 : &madeira_multi_stats.parked,
+                            1, __ATOMIC_RELAXED );
+        return STATUS_WAIT_0 + k;
+    }
+    __atomic_add_fetch( k == MADEIRA_MULTI_BAD ? &madeira_multi_stats.bad :
+                        k == MADEIRA_MULTI_BUSY ? &madeira_multi_stats.busy :
+                        k == MADEIRA_MULTI_HERD ? &madeira_multi_stats.herd : &madeira_multi_stats.none,
+                        1, __ATOMIC_RELAXED );
+
+    if (may_wait && timeout)
+    {
+        /* charge at most the budget, as madeira_fast_wait does: clock
+         * overshoot must never turn the remainder into a poll on its own */
+        unsigned long long spent = madeira_now_ns() - t0;
+        long long left;
+
+        if (spent > budget_ns) spent = budget_ns;
+        left = -timeout->QuadPart - (long long)(spent / 100);
+        store->QuadPart = (left > 0) ? -left : 0;
+        *fallback = store;
+    }
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 #endif /* WINE_IOS */
@@ -3683,6 +4065,18 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
         const LARGE_INTEGER *left;
 
         if ((ret = madeira_fast_wait( handles[0], timeout, &left, &madeira_store )) != STATUS_NOT_IMPLEMENTED)
+        {
+            TRACE( "-> %#x\n", ret );
+            return ret;
+        }
+        timeout = left;
+    }
+    /* ml2120: MADEIRA_FASTSYNC_MULTI takes a wait-any on more than one handle */
+    if (count > 1 && type != WaitAll && !alertable)
+    {
+        const LARGE_INTEGER *left;
+
+        if ((ret = madeira_fast_wait_multi( count, handles, timeout, &left, &madeira_store )) != STATUS_NOT_IMPLEMENTED)
         {
             TRACE( "-> %#x\n", ret );
             return ret;

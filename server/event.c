@@ -44,8 +44,11 @@
  * directly, since the server and every guest thread are one Mach task and
  * one static link.  semaphore.c allocates through the same free list. */
 #include "wine/madeira_fastsync.h"
+#include "process.h"   /* ml2120: the creating process's image, for MADEIRA_FASTSYNC_SEM_EXES */
 
 struct madeira_sync_cell madeira_sync_cells[MADEIRA_SYNC_CELLS];
+/* ml2120: the word multi-object fast waiters park on (madeira_cell_kick_multi) */
+unsigned int madeira_multi_epoch;
 
 /* Allocator state.  Server-thread only, so no lock. */
 static int madeira_cell_next[MADEIRA_SYNC_CELLS];
@@ -89,6 +92,86 @@ int madeira_fastsync_sem_enabled(void)
         madeira_fastsync_sem_on = e && (!strcmp( e, "1" ) || !strcmp( e, "on" ) || !strcmp( e, "yes" ));
     }
     return madeira_fastsync_sem_on && madeira_fastsync_enabled();
+}
+
+/* ml2120: MADEIRA_FASTSYNC_SEM_EXES, the per-image form of MADEIRA_FASTSYNC_SEM.
+ * A semaphore gets a cell only when the process that CREATES it runs one of
+ * the listed images ("RDR2.exe"; ';' or ',' between; "1" or "all" = every
+ * process), so every other process's semaphores stay plain server objects,
+ * exactly as with the variable unset.  A listed semaphore opened by an
+ * unlisted process is still correct there: that client takes no fast path
+ * (dlls/ntdll/unix/sync.c applies the same list to the caller) and the server
+ * keeps the count in the cell, which is the "cells" mode.  Unset, empty or
+ * "0": off.  Needs fastsync's cells; read once. */
+static int madeira_fastsync_sem_exes_on = -1;
+static char madeira_fastsync_sem_exes[256];
+
+int madeira_fastsync_sem_exes_set(void)
+{
+    if (madeira_fastsync_sem_exes_on < 0)
+    {
+        const char *e = getenv( "MADEIRA_FASTSYNC_SEM_EXES" );   /* semaphore cells and fast path for these images (RDR2.exe; ; or , between; 1 = every process), unset/0 = off */
+        int on = e && *e && !(e[0] == '0' && !e[1]);
+
+        if (on) snprintf( madeira_fastsync_sem_exes, sizeof(madeira_fastsync_sem_exes), "%s", e );
+        madeira_fastsync_sem_exes_on = on;
+    }
+    return madeira_fastsync_sem_exes_on && madeira_fastsync_enabled();
+}
+
+/* Is the last component of an image path (WCHARs, `bytes' long, NT or DOS
+ * form) one of the names in `list'?  Case-insensitive, ASCII names. */
+int madeira_image_listed( const WCHAR *path, unsigned int bytes, const char *list )
+{
+    int len = (int)(bytes / sizeof(WCHAR)), start, n;
+    const char *p = list;
+
+    if ((p[0] == '1' && !p[1]) || !strcmp( p, "all" )) return 1;
+    if (!path) return 0;
+    start = len;
+    while (start > 0 && path[start - 1] != '\\' && path[start - 1] != '/') start--;
+    n = len - start;
+    while (*p)
+    {
+        const char *e = p;
+        int i;
+
+        while (*e && *e != ';' && *e != ',') e++;
+        while (p < e && *p == ' ') p++;
+        if (n && e - p == n)
+        {
+            for (i = 0; i < n; i++)
+            {
+                WCHAR a = path[start + i];
+                char b = p[i];
+
+                if (a >= 'A' && a <= 'Z') a += 32;
+                if (b >= 'A' && b <= 'Z') b += 32;
+                if (a != (WCHAR)(unsigned char)b) break;
+            }
+            if (i == n) return 1;
+        }
+        p = *e ? e + 1 : e;
+    }
+    return 0;
+}
+
+/* "does the semaphore being created right now get a cell under the list" */
+static int madeira_sem_exes_current(void)
+{
+    static int announced;
+
+    if (!madeira_fastsync_sem_exes_set()) return 0;
+    if (!current || !current->process || !current->process->image) return 0;
+    if (!madeira_image_listed( current->process->image, current->process->imagelen,
+                               madeira_fastsync_sem_exes )) return 0;
+    if (!announced)
+    {
+        announced = 1;
+        fprintf( stderr, "[fastsync] ml2120 server: semaphore cells for MADEIRA_FASTSYNC_SEM_EXES=%s "
+                 "(first from pid %04x)\n", madeira_fastsync_sem_exes, current->process->id );
+    }
+    return 1;
 }
 
 /* Whether any cell can exist in this session (thread.c's timeout re-check). */
@@ -152,6 +235,7 @@ static int madeira_cell_alloc_kind( unsigned int kind, int manual, unsigned int 
     cell->smax        = smax;
     cell->srv_waiters = 0;
     cell->waiters     = 0;
+    cell->mwaiters    = 0;   /* ml2120 */
     /* publish the generation and the state TOGETHER, and LAST: a client can
      * only learn this index through a get_inproc_sync_fd reply, which the
      * server sends strictly after this, and a client that still holds the
@@ -174,7 +258,8 @@ static int madeira_cell_alloc( int manual, int signaled )
  * is server-thread-only state that lives here, so it is not duplicated. */
 int madeira_sem_cell_alloc( unsigned int initial, unsigned int max )
 {
-    if (!madeira_fastsync_sem_enabled()) return -1;
+    /* ml2120: or the creator's image is in MADEIRA_FASTSYNC_SEM_EXES */
+    if (!madeira_fastsync_sem_enabled() && !madeira_sem_exes_current()) return -1;
     /* create_semaphore rejects max == 0 and initial > max, and NtCreateSemaphore
      * rejects max > LONG_MAX before that, so the count always fits the signed
      * state half.  Check it here anyway rather than trust the caller. */
@@ -207,6 +292,7 @@ static void madeira_cell_free( int idx )
                       __ATOMIC_SEQ_CST );
     if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
         madeira_fast_wake( madeira_cell_futex( cell ), 1 );
+    madeira_cell_kick_multi( cell );   /* ml2120: a multi waiter sees the new generation */
     madeira_cell_next[idx] = madeira_cell_free_head;
     madeira_cell_free_head = idx;
 }
@@ -283,6 +369,7 @@ static void event_sync_disable_cell( struct event_sync *event )
     /* every parked client must wake, re-read DISABLED and go to the server */
     if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
         madeira_fast_wake( madeira_cell_futex( cell ), 1 );
+    madeira_cell_kick_multi( cell );   /* ml2120 */
 }
 #endif
 
@@ -438,6 +525,7 @@ void madeira_event_sync_unclaim( struct object *obj )
         /* the token is up for grabs again; a client may be parked on it */
         if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
             madeira_fast_wake( madeira_cell_futex( cell ), 0 );
+        madeira_cell_kick_multi( cell );   /* ml2120 */
     }
 }
 
@@ -540,6 +628,7 @@ static int event_sync_signal( struct object *obj, unsigned int access, int signa
             {
                 if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
                     madeira_fast_wake( madeira_cell_futex( cell ), event->manual );
+                madeira_cell_kick_multi( cell );   /* ml2120 */
                 wake_up( &event->obj, !event->manual );
             }
             return 1;

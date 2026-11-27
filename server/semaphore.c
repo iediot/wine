@@ -206,6 +206,7 @@ static void semaphore_cell_wake( struct semaphore_sync *sem, unsigned int count 
 
     if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
         madeira_fast_wake( madeira_cell_futex( cell ), count > 1 );
+    madeira_cell_kick_multi( cell );   /* ml2120 */
 }
 
 /* One-way exit from the fast path, the semaphore twin of
@@ -233,6 +234,15 @@ static void semaphore_sync_disable_cell( struct semaphore_sync *sem )
     }
     if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
         madeira_fast_wake( madeira_cell_futex( cell ), 1 );
+    madeira_cell_kick_multi( cell );   /* ml2120 */
+    /* ml2120, with MADEIRA_FASTSYNC_SEM_EXES set: re-run the server's own
+     * queue against the count just folded back.  A client release that CASed
+     * the cell before this disable sends its wake-only release of ZERO
+     * afterwards, and release_semaphore()'s plain arithmetic, authoritative
+     * again, skips wake_up() whenever the count is non-zero -- so a thread
+     * queued here would sleep on a count it could take.  wake_up() over an
+     * empty or unsatisfiable queue is a no-op. */
+    if (madeira_fastsync_sem_exes_set()) wake_up( &sem->obj, 0 );
 }
 
 static int semaphore_sync_add_queue( struct object *obj, struct wait_queue_entry *entry )
@@ -305,6 +315,7 @@ void madeira_semaphore_sync_unclaim( struct object *obj )
     }
     if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
         madeira_fast_wake( madeira_cell_futex( cell ), 0 );
+    madeira_cell_kick_multi( cell );   /* ml2120 */
 }
 
 #endif /* WINE_IOS */

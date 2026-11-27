@@ -240,6 +240,9 @@ extern void madeira_sem_cell_free( int idx );
 extern void madeira_semaphore_sync_unclaim( struct object *sync );
 extern int madeira_semaphore_cell_index( struct object *obj );
 extern int madeira_semaphore_disable_cell( struct object *obj );
+/* ml2120: MADEIRA_FASTSYNC_SEM_EXES (server/event.c) */
+extern int madeira_fastsync_sem_exes_set(void);
+extern int madeira_image_listed( const WCHAR *path, unsigned int bytes, const char *list );
 #endif
 extern void signal_sync( struct object *sync );
 extern void reset_sync( struct object *sync );

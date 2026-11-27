@@ -134,7 +134,9 @@ struct madeira_sync_cell
     unsigned int manual;       /* 1 = manual-reset event                         */
     unsigned int kind;         /* MADEIRA_CELL_KIND_*                            */
     unsigned int smax;         /* semaphore maximum count, immutable             */
-    unsigned int reserved;     /* keeps the cell at 32 bytes, two per cache line */
+    int          mwaiters;     /* ml2120: multi-object fast waiters registered on this
+                                * cell (MADEIRA_FASTSYNC_MULTI); was `reserved', so the
+                                * cell stays at 32 bytes, two per cache line         */
 };
 
 /* The kind, read without synchronisation on purpose: it is written before the
@@ -258,5 +260,40 @@ static inline void madeira_fast_park( const int *addr, int val, uint64_t ns_time
 static inline void madeira_fast_wake( const int *addr, int all ) { }
 
 #endif /* __APPLE__ */
+
+/* ml2120 MADEIRA_FASTSYNC_MULTI: the multi-object WaitAny fast path.
+ *
+ * A thread can park on one address only, so a client waiting for ANY of
+ * several cells parks on one shared word, `madeira_multi_epoch' (defined in
+ * server/event.c next to the table), after adding itself to `mwaiters' of
+ * every cell it waits for.  Every write that can make a cell signalled, or
+ * take it out of the fast path (a set, a release, an unclaim, a disable, a
+ * free), is followed by madeira_cell_kick_multi() on that cell, which bumps
+ * the epoch and wakes every multi-parked thread when -- and only when -- some
+ * multi waiter is registered there.  With MADEIRA_FASTSYNC_MULTI off nothing
+ * ever registers, `mwaiters' stays 0, and the kick is one load.
+ *
+ * (3) the third Dekker pairing, multi waiter vs. any setter:
+ *       waiter:  mwaiters++ on each cell (seq_cst); E = load epoch (seq_cst);
+ *                load every state (seq_cst); nothing -> park while epoch == E
+ *       setter:  write state (seq_cst RMW); load mwaiters (seq_cst)
+ *                -> if > 0: epoch++ (seq_cst), wake all on the epoch
+ *     If the setter reads 0, its write precedes the waiter's loads, which see
+ *     it.  If it reads > 0 it bumps the epoch after its write: a waiter that
+ *     loaded E before the bump does not sleep (the park re-checks the word in
+ *     the kernel) or is woken, and one that loaded E after it sees the write.
+ * A stray count left on a recycled cell (the allocator zeroes `mwaiters',
+ * like `waiters') can only cause a spurious wake, or, if it went negative, a
+ * missed kick that the waiter's park cap (2 ms) then covers. */
+extern unsigned int madeira_multi_epoch;
+
+static inline void madeira_cell_kick_multi( struct madeira_sync_cell *cell )
+{
+    if (__atomic_load_n( &cell->mwaiters, __ATOMIC_SEQ_CST ) > 0)
+    {
+        __atomic_add_fetch( &madeira_multi_epoch, 1, __ATOMIC_SEQ_CST );
+        madeira_fast_wake( (const int *)&madeira_multi_epoch, 1 );
+    }
+}
 
 #endif /* __WINE_MADEIRA_FASTSYNC_H */

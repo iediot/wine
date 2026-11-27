@@ -4297,6 +4297,25 @@ NTSTATUS WINAPI NtYieldExecution(void)
 /******************************************************************
  *		NtDelayExecution (NTDLL.@)
  */
+#ifdef WINE_IOS
+/* madeira-bcd load-wait (build/ntdll-unix/loadwait_ios.h): the body below is
+ * ios_delay_execution; the exported NtDelayExecution after it times a
+ * non-alertable delay of the followed process while the loading census is armed
+ * (MADEIRA_LOAD_WAIT) and lists it as kind "sleep" with the caller's own timeout.
+ * Alertable delays are server waits and are listed by server_select. Not armed:
+ * one load, then this unchanged body. */
+extern volatile int ios_lw_state;
+extern void ios_lw_note_other( int kind, unsigned long long obj, const LARGE_INTEGER *timeout,
+                               unsigned long long t0_ns, unsigned int ret );
+static inline unsigned long long ios_lw_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+#define NtDelayExecution ios_delay_execution
+static
+#endif
 NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
     unsigned int status = STATUS_SUCCESS;
@@ -4368,6 +4387,20 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
     }
     return STATUS_SUCCESS;
 }
+#ifdef WINE_IOS
+#undef NtDelayExecution
+NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeout )
+{
+    if (__builtin_expect( __atomic_load_n( &ios_lw_state, __ATOMIC_RELAXED ) == 2 /* IOS_LW_ARMED */, 0 ) && !alertable)
+    {
+        unsigned long long t0 = ios_lw_now_ns();
+        NTSTATUS ret = ios_delay_execution( alertable, timeout );
+        ios_lw_note_other( 2 /* IOS_LW_SLEEP */, 0, timeout, t0, ret );
+        return ret;
+    }
+    return ios_delay_execution( alertable, timeout );
+}
+#endif
 
 
 /******************************************************************************
@@ -6009,6 +6042,14 @@ static LONGLONG update_timeout( ULONGLONG end )
 /***********************************************************************
  *             NtWaitForAlertByThreadId (NTDLL.@)
  */
+#ifdef WINE_IOS
+/* madeira-bcd load-wait: the body below is ios_wait_for_alert_by_thread_id; the
+ * exported NtWaitForAlertByThreadId after it times the followed process's alert
+ * waits (critical sections, SRW locks, condition variables, WaitOnAddress) while
+ * the loading census is armed and lists them as kind "alert" with the address. */
+#define NtWaitForAlertByThreadId ios_wait_for_alert_by_thread_id
+static
+#endif
 NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
 {
     IOS_ECO_POLL();   /* ml1133 */
@@ -6211,6 +6252,20 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
     }
 #endif
 }
+#ifdef WINE_IOS
+#undef NtWaitForAlertByThreadId
+NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
+{
+    if (__builtin_expect( __atomic_load_n( &ios_lw_state, __ATOMIC_RELAXED ) == 2 /* IOS_LW_ARMED */, 0 ))
+    {
+        unsigned long long t0 = ios_lw_now_ns();
+        NTSTATUS ret = ios_wait_for_alert_by_thread_id( address, timeout );
+        ios_lw_note_other( 3 /* IOS_LW_ALERT */, (unsigned long long)(ULONG_PTR)address, timeout, t0, ret );
+        return ret;
+    }
+    return ios_wait_for_alert_by_thread_id( address, timeout );
+}
+#endif
 
 
 /***********************************************************************

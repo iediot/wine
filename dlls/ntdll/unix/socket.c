@@ -930,6 +930,7 @@ struct ios_tl_ent
     int                post_len;
     unsigned char      post5[5];
     char               host[64];    /* TLS SNI from the ClientHello, or the peer IP */
+    unsigned int       wpid, wtid;  /* madeira-bcd sock-owner: Wine pid/tid of the first send/recv */
 };
 
 /* The server name a TLS ClientHello asks for (the SNI extension, plain text), so
@@ -980,6 +981,23 @@ static double ios_tl_d( unsigned long long a, unsigned long long b )
     return (a && b && b >= a) ? (double)(b - a) / 1e6 : -1.0;
 }
 
+/* madeira-bcd sock-owner (2026-11-27): RDR2's loading screen waits ~10-70 s and
+ * ends, in every log, with the same pair of HTTPS requests (prod.ros, then an
+ * Akamai CDN host); [sock-tl] could not say whether RDR2, the launcher or Social
+ * Club's helper made them. Each line now ends with by=<Wine pid>/<tid> of the
+ * thread that first sent or received on the connection (TEB read once per
+ * connection). MADEIRA_SOCK_TL_OWNER=0: the line as before. */
+static int ios_tl_owner_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_SOCK_TL_OWNER" );   /* [sock-tl] by=<pid>/<tid> of the connection's first user; 0 = the line without it */
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static void ios_tl_flush( struct ios_tl_ent *e, const char *fate )
 {
     char post[32];
@@ -990,6 +1008,17 @@ static void ios_tl_flush( struct ios_tl_ent *e, const char *fate )
     else
         strcpy( post, "NONE" );
 
+    if (ios_tl_owner_on())   /* madeira-bcd sock-owner: which process talks to whom */
+        dprintf( 2, "[sock-tl] fd=%d gen=%u port=%u open->CH=%.1f CH->flight=%.1f "
+                    "flight->fin=%.1f fin->tail=%.1f tail->post=%.1f total=%.1fms "
+                    "tx=%u/%luB rx=%u/%luB alerts=%u post=%s fate=%s host=%s by=%04x/%04x rev=ml591\n",
+                 e->fd, e->gen, e->port,
+                 ios_tl_d( e->t0, e->t_ch ), ios_tl_d( e->t_ch, e->t_flight ),
+                 ios_tl_d( e->t_flight, e->t_fin ), ios_tl_d( e->t_fin, e->t_tail ),
+                 ios_tl_d( e->t_tail, e->t_post ), ios_tl_d( e->t0, e->t_last ),
+                 e->n_send, e->b_send, e->n_recv, e->b_recv, e->alerts, post, fate,
+                 e->host[0] ? e->host : "?", e->wpid, e->wtid );
+    else
     dprintf( 2, "[sock-tl] fd=%d gen=%u port=%u open->CH=%.1f CH->flight=%.1f "
                 "flight->fin=%.1f fin->tail=%.1f tail->post=%.1f total=%.1fms "
                 "tx=%u/%luB rx=%u/%luB alerts=%u post=%s fate=%s host=%s rev=ml591\n",
@@ -1074,6 +1103,8 @@ static void ios_sock_tl( int fd, int is_send, const void *buf, long ret_bytes, i
         e = &ios_tl_tab[freeslot];
         memset( e, 0, sizeof(*e) );
         e->fd = fd; e->port = port; e->gen = ++ios_tl_gen; e->t0 = now;
+        e->wpid = (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess;   /* madeira-bcd sock-owner */
+        e->wtid = (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread;
         if (pa.ss_family == AF_INET)
             inet_ntop( AF_INET, &((const struct sockaddr_in *)&pa)->sin_addr, e->host, sizeof(e->host) );
         else

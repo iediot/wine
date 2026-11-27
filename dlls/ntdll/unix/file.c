@@ -7766,6 +7766,172 @@ static int ios_guest_log_utf16( const unsigned char *src, unsigned int n,
     return written;
 }
 
+/* madeira-bcd guest-log-files (2026-11-27): MADEIRA_GUEST_LOG_FILES lists parts of
+ * log file paths (';' between, ASCII case-insensitive, e.g. "Social Club;
+ * Launcher/launcher.log"). Every line written to a matching *.log / *.txt file is
+ * mirrored as "[guest-log] F#n", with its own budget (MADEIRA_GUEST_LOG_FILES_LIMIT,
+ * default 4000, at most 8000) so a chatty file elsewhere cannot use it up. Made
+ * for RDR2's loading screen: Social Club's own logs time its sign-in steps next
+ * to the [xp] lines, and the keyword mirror's 64 lines were gone to the
+ * launcher's "Start Menu" errors a minute before RDR2 started (log 2026-11-27
+ * 01:05). Values after password=/token=/secret= and after ticket, email,
+ * sessionkey and authorization keys are written as <redacted>. Unset: the
+ * variable is read on the first file write, then one load per write, and the
+ * keyword mirror below behaves exactly as before. */
+static char ios_glf_list[8][64];
+static unsigned int ios_glf_n, ios_glf_limit, ios_glf_emitted;
+static int ios_glf_mode = -1;                 /* -1 not read, -2 being read, 0 off, 1 on */
+static unsigned long long ios_glf_prev_hash, ios_glf_file_hashes[16];
+
+static void ios_glf_init( void )
+{
+    const char *e = getenv( "MADEIRA_GUEST_LOG_FILES" );   /* mirror every line of log files whose path contains one of these (';' between, case-insensitive); unset = off */
+    const char *l = getenv( "MADEIRA_GUEST_LOG_FILES_LIMIT" );   /* lines for MADEIRA_GUEST_LOG_FILES (4000; at most 8000) */
+    unsigned int lim = l ? (unsigned int)strtoul( l, NULL, 10 ) : 0, n = 0;
+    const char *p = e;
+
+    while (p && *p && n < 8)
+    {
+        const char *q = p;
+        unsigned int k = 0;
+        while (*q && *q != ';') q++;
+        while (p < q && *p == ' ') p++;
+        while (p < q && k < sizeof(ios_glf_list[0]) - 1)
+        {
+            char c = *p++;
+            ios_glf_list[n][k++] = c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
+        }
+        while (k && ios_glf_list[n][k - 1] == ' ') k--;
+        ios_glf_list[n][k] = 0;
+        if (k) n++;
+        p = *q ? q + 1 : q;
+    }
+    if (!lim || lim > 8000) lim = 4000;
+    ios_glf_n = n;
+    __atomic_store_n( &ios_glf_limit, lim, __ATOMIC_RELAXED );
+    __atomic_store_n( &ios_glf_mode, n ? 1 : 0, __ATOMIC_RELEASE );
+    if (n)
+        dprintf( 2, "[guest-log] madeira-bcd file mirror: every line of log files whose path contains %s%s%s%s%s "
+                 "(%u entries), %u lines (MADEIRA_GUEST_LOG_FILES, MADEIRA_GUEST_LOG_FILES_LIMIT)\n",
+                 ios_glf_list[0], n > 1 ? " | " : "", n > 1 ? ios_glf_list[1] : "", n > 2 ? " | " : "",
+                 n > 2 ? ios_glf_list[2] : "", n, lim );
+}
+
+/* Values after these keys (then optional quote, then '=' or ':') -> <redacted>. */
+static unsigned int ios_glf_redact_more( char *buf, unsigned int len, unsigned int capacity )
+{
+    static const char *const keys[] = { "ticket", "email", "sessionkey", "authorization" };
+    char out[4096 + 16];
+    unsigned int i = 0, o = 0, k;
+
+    if (capacity > sizeof(out)) capacity = sizeof(out);
+    while (i < len && o + 1 < capacity)
+    {
+        unsigned int kl = 0, j = 0, v;
+        for (k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
+        {
+            kl = strlen( keys[k] );
+            for (j = 0; j < kl && i + j < len; j++)
+            {
+                char c = buf[i + j];
+                if ((c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c) != keys[k][j]) break;
+            }
+            if (j == kl) break;
+        }
+        if (k == sizeof(keys) / sizeof(keys[0])) { out[o++] = buf[i++]; continue; }
+        v = i + kl;
+        while (v < len && (buf[v] == '"' || buf[v] == '\'' || buf[v] == ' ')) v++;
+        if (v >= len || (buf[v] != '=' && buf[v] != ':')) { out[o++] = buf[i++]; continue; }
+        v++;
+        while (v < len && (buf[v] == ' ' || buf[v] == '"' || buf[v] == '\'')) v++;
+        for (; i < v && o + 1 < capacity; i++) out[o++] = buf[i];
+        {
+            static const char mask[] = "<redacted>";
+            unsigned int m;
+            for (m = 0; mask[m] && o + 1 < capacity; m++) out[o++] = mask[m];
+        }
+        while (i < len && buf[i] != ' ' && buf[i] != '\t' && buf[i] != '"' && buf[i] != '\'' &&
+               buf[i] != '&' && buf[i] != ',' && buf[i] != '}') i++;
+    }
+    memcpy( buf, out, o );
+    buf[o] = 0;
+    return o;
+}
+
+/* 1: the write went to a listed file (mirrored here, or nothing to mirror);
+ * 0: not a listed file, the keyword mirror decides as before. */
+static int ios_glf_write( int fd, const unsigned char *text, unsigned int length )
+{
+    char path[PATH_MAX], lower[PATH_MAX], decoded[4096], clean[4096 + 16];
+    const char *name, *ext;
+    unsigned int i, n, start, k, serial;
+    unsigned long long ph = 14695981039346656037ULL;
+
+    n = length < 4096 ? length : 4096;
+    {
+        int wide = n >= 2 && ((text[0] == 0xff && text[1] == 0xfe) || (text[0] == 0xfe && text[1] == 0xff));
+        for (i = 0; !wide && i < n; i++) if (!text[i]) wide = 1;
+        if (wide)
+        {
+            int count = ios_guest_log_utf16( text, n, length > n, decoded, sizeof(decoded) );
+            if (count < 0) return 0;
+            n = count;
+            text = (const unsigned char *)decoded;
+        }
+    }
+    for (i = 0; i < n; i++)
+        if (text[i] < 32 && text[i] != '\n' && text[i] != '\r' && text[i] != '\t') return 0;   /* binary */
+    if (!ios_guest_log_fd_path( fd, path, sizeof(path) )) return 0;
+    name = strrchr( path, '/' );
+    name = name ? name + 1 : path;
+    ext = strrchr( name, '.' );
+    if (!ext || (strcasecmp( ext, ".log" ) && strcasecmp( ext, ".txt" ))) return 0;
+    for (i = 0; path[i] && i < sizeof(lower) - 1; i++)
+        lower[i] = path[i] >= 'A' && path[i] <= 'Z' ? path[i] + ('a' - 'A') : (path[i] == '\\' ? '/' : path[i]);
+    lower[i] = 0;
+    for (k = 0; k < ios_glf_n && !strstr( lower, ios_glf_list[k] ); k++) ;
+    if (k == ios_glf_n) return 0;
+
+    {
+        const char *p;
+        for (p = path; *p; p++) ph = (ph ^ (unsigned char)*p) * 1099511628211ULL;
+        for (k = 0; k < 16; k++)
+        {
+            unsigned long long cur = __atomic_load_n( &ios_glf_file_hashes[k], __ATOMIC_RELAXED );
+            if (cur == ph) break;
+            if (!cur && __atomic_compare_exchange_n( &ios_glf_file_hashes[k], &cur, ph, 0,
+                                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+            {
+                dprintf( 2, "[guest-log] F file %s\n", path );
+                break;
+            }
+            if (cur == ph) break;
+        }
+    }
+    for (start = 0; start < n; start = i + 1)
+    {
+        unsigned long long hash = 14695981039346656037ULL;
+        unsigned int len, shown, j;
+
+        for (i = start; i < n && text[i] != '\n'; i++) ;
+        len = i - start;
+        while (len && (text[start + len - 1] == '\r' || text[start + len - 1] == ' ')) len--;
+        if (len < 3) continue;
+        for (j = 0; j < len; j++) hash = (hash ^ text[start + j]) * 1099511628211ULL;
+        if (__atomic_exchange_n( &ios_glf_prev_hash, hash, __ATOMIC_RELAXED ) == hash) continue;
+        serial = __atomic_fetch_add( &ios_glf_emitted, 1, __ATOMIC_RELAXED );
+        if (serial >= __atomic_load_n( &ios_glf_limit, __ATOMIC_RELAXED )) break;
+        len = ios_guest_log_redact( (const char *)text + start, len, clean, sizeof(clean) );
+        len = ios_glf_redact_more( clean, len, sizeof(clean) );
+        shown = len > 300 ? 300 : len;
+        if (shown < len)
+            while (shown && (clean[shown] & 0xc0) == 0x80) shown--;
+        dprintf( 2, "[guest-log] F#%u tid=%04x %.*s%s\n", serial + 1, (unsigned int)GetCurrentThreadId(),
+                 (int)shown, clean, shown < len ? " [truncated]" : "" );
+    }
+    return 1;
+}
+
 static void ios_guest_log_mirror( int fd, const void *buffer, unsigned int length )
 {
     static int mode = -1;                 /* 0 off, 1 keyword lines, 2 every line */
@@ -7794,6 +7960,19 @@ static void ios_guest_log_mirror( int fd, const void *buffer, unsigned int lengt
             dprintf( 2, "[guest-log] madeira-bcd text-log mirror: %s, %u lines (MADEIRA_GUEST_LOG=all|0, "
                      "MADEIRA_GUEST_LOG_LIMIT=N)\n", m == 0 ? "off" : m == 2 ? "every line" : "error/GPU/display lines",
                      lim );
+    }
+    {   /* madeira-bcd guest-log-files: listed files first, with their own budget */
+        int fm = __atomic_load_n( &ios_glf_mode, __ATOMIC_ACQUIRE );
+        if (fm == -1)
+        {
+            int expect = -1;   /* -2 while one thread reads the variables; the others skip this write */
+            if (__atomic_compare_exchange_n( &ios_glf_mode, &expect, -2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
+                ios_glf_init();
+            fm = __atomic_load_n( &ios_glf_mode, __ATOMIC_ACQUIRE );
+        }
+        if (fm > 0 && length >= 5 &&
+            __atomic_load_n( &ios_glf_emitted, __ATOMIC_RELAXED ) < __atomic_load_n( &ios_glf_limit, __ATOMIC_RELAXED ) &&
+            ios_glf_write( fd, text, length )) goto out;
     }
     if (!m || length < 5) goto out;
     if (__atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= __atomic_load_n( &limit, __ATOMIC_RELAXED )) goto out;

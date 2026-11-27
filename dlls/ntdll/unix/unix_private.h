@@ -255,6 +255,9 @@ extern unsigned int server_select( const union select_op *select_op, data_size_t
 extern unsigned int server_wait( const union select_op *select_op, data_size_t size, UINT flags,
                                  const LARGE_INTEGER *timeout );
 extern unsigned int server_wait_for_object( HANDLE handle, BOOL alertable, const LARGE_INTEGER *timeout );
+#ifdef WINE_IOS
+extern void ios_poll_yield(void);   /* sync.c: NtYieldExecution after a failed poll, no yield-esc */
+#endif
 extern unsigned int server_queue_process_apc( HANDLE process, const union apc_call *call,
                                               union apc_result *result );
 extern int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,

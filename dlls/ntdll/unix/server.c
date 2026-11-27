@@ -812,7 +812,11 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
     /* A test on Windows 2000 shows that Windows always yields during
        a wait, but a wait that is hit by an event gets a priority
        boost as well.  This seems to model that behavior the closest.  */
+#ifdef WINE_IOS
+    if (ret == STATUS_TIMEOUT) ios_poll_yield();   /* madeira-bcd yield-esc: not a spin yield (sync.c) */
+#else
     if (ret == STATUS_TIMEOUT) NtYieldExecution();
+#endif
     return ret;
 }
 

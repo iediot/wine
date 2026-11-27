@@ -1765,7 +1765,7 @@ static inline int madeira_peek_budget(void)
     /* the yield test is independent of the server test: both periods are
      * powers of two, so testing the server one first would put every yield
      * on a poll that went to the server anyway */
-    if (!(s & (MADEIRA_FS_PEEK_YIELD - 1))) NtYieldExecution();
+    if (!(s & (MADEIRA_FS_PEEK_YIELD - 1))) ios_poll_yield();   /* not a spin yield: no yield-esc */
     return (s & (MADEIRA_FS_PEEK_EVERY - 1)) != 0;    /* 0 = send this one to the server */
 }
 
@@ -2778,7 +2778,8 @@ static struct ios_yesc_cfg ios_yesc_conf;
 static pthread_once_t ios_yesc_once = PTHREAD_ONCE_INIT;
 static __thread signed char ios_yesc_on = -1;   /* this thread: -1 = not decided yet */
 static __thread struct ios_yesc_state ios_yesc;
-static __thread int ios_yesc_in_timed_delay;     /* NtDelayExecution's own yield: 1 = timed sleep, 2 = Sleep(0) */
+static __thread int ios_yesc_in_timed_delay;     /* NtDelayExecution's own yield: 1 = timed sleep, 2 = Sleep(0);
+                                                  * 3 = ios_poll_yield (after a failed poll) */
 
 static void ios_yesc_init(void)
 {
@@ -4209,8 +4210,8 @@ NTSTATUS WINAPI NtYieldExecution(void)
 #ifdef WINE_IOS
     {   /* madeira-bcd yield-esc: per-thread counts, and the opt-in escalation (see ios_ystat_tab) */
         struct ios_ystat *ys = ios_ystat_get();
-        if (ys && !ios_yesc_in_timed_delay) __atomic_add_fetch( &ys->yields, 1, __ATOMIC_RELAXED );
-        if (ios_yesc_in_timed_delay != 1 && ios_yesc_thread_on())
+        if (ys && (!ios_yesc_in_timed_delay || ios_yesc_in_timed_delay == 3)) __atomic_add_fetch( &ys->yields, 1, __ATOMIC_RELAXED );
+        if ((!ios_yesc_in_timed_delay || ios_yesc_in_timed_delay == 2) && ios_yesc_thread_on())
         {
             unsigned int us = ios_yesc_step( &ios_yesc, &ios_yesc_conf,
                                              clock_gettime_nsec_np( CLOCK_THREAD_CPUTIME_ID ) );
@@ -4292,6 +4293,23 @@ NTSTATUS WINAPI NtYieldExecution(void)
     return STATUS_NO_YIELD_PERFORMED;
 #endif
 }
+
+#ifdef WINE_IOS
+/* madeira-bcd yield-esc: the yield ntdll makes for itself after a poll that found
+ * nothing (server_wait's STATUS_TIMEOUT yield, the fastsync peek's every 64th).
+ * That is Wine's model of "Windows yields in a wait", not the program spinning: it
+ * neither escalates nor counts toward the streak (and, like any poll, does not reset
+ * it), so a thread polling many handles between real waits is not slept 20-100 us
+ * after each poll. SwitchToThread, Sleep(0) and the futex back-off still escalate.
+ * It is still counted in [xp-t] y, as before. */
+void ios_poll_yield(void)
+{
+    int prev = ios_yesc_in_timed_delay;
+    ios_yesc_in_timed_delay = 3;
+    NtYieldExecution();
+    ios_yesc_in_timed_delay = prev;
+}
+#endif
 
 
 /******************************************************************
